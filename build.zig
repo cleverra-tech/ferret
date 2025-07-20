@@ -118,6 +118,78 @@ pub fn build(b: *std.Build) void {
     const http_test_step = b.step("test-http", "Run HTTP test");
     http_test_step.dependOn(&run_http_test.step);
 
+    // HTTP/3 demo
+    const http3_demo = b.addExecutable(.{
+        .name = "http3_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http3_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(http3_demo);
+
+    const run_http3_demo = b.addRunArtifact(http3_demo);
+    const http3_demo_step = b.step("demo-http3", "Run HTTP/3 demo");
+    http3_demo_step.dependOn(&run_http3_demo.step);
+
+    // HTTP/2 demo
+    const http2_demo = b.addExecutable(.{
+        .name = "http2_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http2_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(http2_demo);
+
+    const run_http2_demo = b.addRunArtifact(http2_demo);
+    const http2_demo_step = b.step("demo-http2", "Run HTTP/2 demo");
+    http2_demo_step.dependOn(&run_http2_demo.step);
+
+    // HTTP protocols comparison demo
+    const http_comparison_demo = b.addExecutable(.{
+        .name = "http_protocols_comparison",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http_protocols_comparison.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(http_comparison_demo);
+
+    const run_http_comparison_demo = b.addRunArtifact(http_comparison_demo);
+    const http_comparison_demo_step = b.step("demo-http-comparison", "Run HTTP protocols comparison demo");
+    http_comparison_demo_step.dependOn(&run_http_comparison_demo.step);
+
+    // Unified HTTP demo
+    const unified_http_demo = b.addExecutable(.{
+        .name = "unified_http_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/unified_http_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(unified_http_demo);
+
+    const run_unified_http_demo = b.addRunArtifact(unified_http_demo);
+    const unified_http_demo_step = b.step("demo-unified-http", "Run unified HTTP API demo");
+    unified_http_demo_step.dependOn(&run_unified_http_demo.step);
+
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);

@@ -25,7 +25,10 @@ pub const Socket = @import("io/socket.zig").Socket;
 pub const Buffer = @import("io/buffer.zig").Buffer;
 
 // Protocols
-pub const Http = @import("protocols/http.zig");
+pub const Http = @import("protocols/http_unified.zig"); // Unified HTTP API (defaults to HTTP/3)
+pub const Http1 = @import("protocols/http.zig"); // HTTP/1.1 implementation
+pub const Http2 = @import("protocols/http2.zig"); // HTTP/2 implementation
+pub const Http3 = @import("protocols/http3.zig"); // HTTP/3 implementation
 pub const WebSocket = @import("protocols/websocket.zig");
 pub const Json = @import("protocols/json.zig");
 
