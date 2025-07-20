@@ -6,7 +6,9 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.log.info("Ferret v{any} starting...", .{ferret.version});
+    const version_str = try ferret.versionString(allocator);
+    defer allocator.free(version_str);
+    std.log.info("Ferret v{s} starting...", .{version_str});
 
     // Example usage
     var string = ferret.String.init(allocator);

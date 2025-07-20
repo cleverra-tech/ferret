@@ -45,4 +45,22 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_tests);
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
+
+    // JSON benchmark
+    const json_benchmark = b.addExecutable(.{
+        .name = "json_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/json_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(json_benchmark);
+
+    const run_json_benchmark = b.addRunArtifact(json_benchmark);
+    const benchmark_step = b.step("benchmark", "Run JSON benchmark");
+    benchmark_step.dependOn(&run_json_benchmark.step);
 }

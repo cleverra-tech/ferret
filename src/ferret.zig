@@ -68,6 +68,15 @@ pub const version = std.SemanticVersion{
     .pre = "alpha",
 };
 
+/// Get human-readable version string
+pub fn versionString(alloc: std.mem.Allocator) ![]u8 {
+    if (version.pre) |pre| {
+        return std.fmt.allocPrint(alloc, "{}.{}.{}-{s}", .{ version.major, version.minor, version.patch, pre });
+    } else {
+        return std.fmt.allocPrint(alloc, "{}.{}.{}", .{ version.major, version.minor, version.patch });
+    }
+}
+
 test {
     std.testing.refAllDecls(@This());
 }
