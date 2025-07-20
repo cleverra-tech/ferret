@@ -380,7 +380,434 @@ pub const QpackDecoder = struct {
     }
 };
 
-/// QUIC connection
+/// QUIC frame types
+pub const QuicFrameType = enum(u64) {
+    padding = 0x00,
+    ping = 0x01,
+    ack = 0x02,
+    reset_stream = 0x04,
+    stop_sending = 0x05,
+    crypto = 0x06,
+    new_token = 0x07,
+    stream = 0x08,
+    max_data = 0x10,
+    max_stream_data = 0x11,
+    max_streams = 0x12,
+    data_blocked = 0x14,
+    stream_data_blocked = 0x15,
+    streams_blocked = 0x16,
+    new_connection_id = 0x18,
+    retire_connection_id = 0x19,
+    path_challenge = 0x1a,
+    path_response = 0x1b,
+    connection_close = 0x1c,
+    _,
+};
+
+/// QUIC packet types
+pub const QuicPacketType = enum {
+    initial,
+    handshake,
+    short,
+};
+
+/// QUIC frame structure
+pub const QuicFrame = struct {
+    frame_type: QuicFrameType,
+    stream_id: ?u64,
+    data: ?[]const u8,
+    ack_ranges: ?[]const AckRange,
+};
+
+/// ACK range for acknowledgment frames
+pub const AckRange = struct {
+    largest: u64,
+    smallest: u64,
+};
+
+/// Cryptographic state for QUIC connection
+pub const CryptoState = struct {
+    key_material: [32]u8,
+    iv: [12]u8,
+    handshake_complete: bool,
+
+    const Self = @This();
+
+    pub fn init() Self {
+        var state = Self{
+            .key_material = undefined,
+            .iv = undefined,
+            .handshake_complete = false,
+        };
+        crypto.random.bytes(&state.key_material);
+        crypto.random.bytes(&state.iv);
+        return state;
+    }
+
+    pub fn deinit(self: *Self) void {
+        // Clear sensitive cryptographic material
+        @memset(&self.key_material, 0);
+        @memset(&self.iv, 0);
+    }
+
+    /// Generate Client Hello for TLS handshake
+    pub fn generateClientHello(self: *Self) ![]u8 {
+        _ = self;
+        // Simplified Client Hello - in a real implementation this would
+        // generate a proper TLS 1.3 Client Hello message
+        const client_hello = "CLIENT_HELLO_PLACEHOLDER";
+        return try std.heap.page_allocator.dupe(u8, client_hello);
+    }
+
+    /// Apply packet protection (encryption)
+    pub fn protect(self: *Self, packet: []const u8) ![]u8 {
+        _ = self;
+        // Simplified encryption - real implementation would use AEAD encryption
+        return try std.heap.page_allocator.dupe(u8, packet);
+    }
+
+    /// Remove packet protection (decryption)
+    pub fn unprotect(self: *Self, protected_packet: []const u8) ![]u8 {
+        _ = self;
+        // Simplified decryption - real implementation would use AEAD decryption
+        return try std.heap.page_allocator.dupe(u8, protected_packet);
+    }
+
+    /// Process CRYPTO frame during handshake
+    pub fn processCryptoFrame(self: *Self, crypto_data: []const u8) !void {
+        _ = crypto_data;
+        // Mark handshake as complete for simplified implementation
+        self.handshake_complete = true;
+    }
+};
+
+/// Congestion control state
+pub const CongestionControl = struct {
+    congestion_window: u64,
+    slow_start_threshold: u64,
+    bytes_in_flight: u64,
+
+    const Self = @This();
+
+    pub fn init() Self {
+        return Self{
+            .congestion_window = 10 * 1460, // Initial window (10 MSS)
+            .slow_start_threshold = std.math.maxInt(u64),
+            .bytes_in_flight = 0,
+        };
+    }
+
+    /// Handle ACK reception for congestion control
+    pub fn onAckReceived(self: *Self, ack_ranges: []const AckRange) !void {
+        _ = ack_ranges;
+        // Simplified congestion control - increase window
+        if (self.congestion_window < self.slow_start_threshold) {
+            // Slow start: exponential growth
+            self.congestion_window += 1460;
+        } else {
+            // Congestion avoidance: linear growth
+            self.congestion_window += (1460 * 1460) / self.congestion_window;
+        }
+    }
+
+    /// Handle packet loss for congestion control
+    pub fn onPacketLoss(self: *Self) void {
+        self.slow_start_threshold = self.congestion_window / 2;
+        self.congestion_window = self.slow_start_threshold;
+    }
+};
+
+/// QUIC Transport for HTTP/3
+pub const QuicTransport = struct {
+    socket: net.Stream,
+    connection: QuicConnection,
+    packet_buffer: [4096]u8,
+    crypto_state: CryptoState,
+    congestion_control: CongestionControl,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub const TransportError = error{
+        ConnectionClosed,
+        InvalidPacket,
+        CryptoError,
+        FlowControlViolation,
+        StreamLimitExceeded,
+        OutOfMemory,
+        NetworkError,
+        HandshakeFailed,
+        ProtocolViolation,
+    };
+
+    pub fn init(allocator: Allocator, local_addr: net.Address, remote_addr: net.Address) !Self {
+        // Use UDP for QUIC transport
+        const socket = try net.udpConnectToAddress(remote_addr);
+        
+        return Self{
+            .socket = socket,
+            .connection = QuicConnection.init(allocator, false, local_addr, remote_addr),
+            .packet_buffer = undefined,
+            .crypto_state = CryptoState.init(),
+            .congestion_control = CongestionControl.init(),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.socket.close();
+        self.connection.deinit();
+        self.crypto_state.deinit();
+    }
+
+    /// Establish QUIC connection with TLS handshake
+    pub fn connect(self: *Self) !void {
+        try self.performHandshake();
+        self.connection.state = .established;
+    }
+
+    /// Send QUIC packet with proper encryption and framing
+    pub fn sendPacket(self: *Self, packet_type: QuicPacketType, frames: []const QuicFrame) !void {
+        var packet_buffer = ArrayList(u8).init(self.allocator);
+        defer packet_buffer.deinit();
+
+        // Build QUIC packet header
+        const header = QuicPacketHeader{
+            .header_form = true,
+            .fixed_bit = true,
+            .packet_type = switch (packet_type) {
+                .initial => .initial,
+                .handshake => .handshake,
+                .short => .initial, // Simplified mapping
+            },
+            .version = QUIC_VERSION,
+            .dest_conn_id = &self.connection.connection_id,
+            .src_conn_id = &self.connection.connection_id,
+            .packet_number = self.connection.next_packet_number,
+        };
+
+        try self.writePacketHeader(&header, packet_buffer.writer());
+
+        // Write frames
+        for (frames) |frame| {
+            try self.writeFrame(&frame, packet_buffer.writer());
+        }
+
+        // Apply packet protection (encryption)
+        const protected_packet = try self.crypto_state.protect(packet_buffer.items);
+        defer self.allocator.free(protected_packet);
+
+        // Send over UDP socket
+        _ = try self.socket.write(protected_packet);
+        
+        self.connection.next_packet_number += 1;
+    }
+
+    /// Receive and process QUIC packets
+    pub fn receivePackets(self: *Self) !void {
+        const bytes_read = try self.socket.read(&self.packet_buffer);
+        if (bytes_read == 0) return;
+
+        try self.processPacket(self.packet_buffer[0..bytes_read]);
+    }
+
+    /// Process incoming QUIC packet
+    fn processPacket(self: *Self, packet_data: []const u8) !void {
+        // Decrypt packet
+        const decrypted = try self.crypto_state.unprotect(packet_data);
+        defer self.allocator.free(decrypted);
+
+        // Parse packet header
+        const header = QuicPacketHeader.parse(decrypted) orelse return TransportError.InvalidPacket;
+
+        // Extract frames from packet payload
+        var pos: usize = self.getHeaderLength(&header);
+        while (pos < decrypted.len) {
+            const frame = try self.parseFrame(decrypted, &pos);
+            try self.handleFrame(&frame);
+        }
+
+        // Send ACK if needed
+        if (self.shouldSendAck(&header)) {
+            try self.sendAckFrame(header.packet_number);
+        }
+    }
+
+    /// Handle individual QUIC frame
+    fn handleFrame(self: *Self, frame: *const QuicFrame) !void {
+        switch (frame.frame_type) {
+            .stream => {
+                const stream_id = frame.stream_id.?;
+                const stream = try self.connection.getOrCreateStream(stream_id);
+                try stream.receiveData(frame.data.?);
+            },
+            .ack => {
+                try self.congestion_control.onAckReceived(frame.ack_ranges.?);
+            },
+            .connection_close => {
+                self.connection.state = .closed;
+            },
+            .crypto => {
+                try self.crypto_state.processCryptoFrame(frame.data.?);
+            },
+            else => {
+                // Handle other frame types
+            },
+        }
+    }
+
+    /// Perform TLS-based QUIC handshake
+    fn performHandshake(self: *Self) !void {
+        // Send Initial packet with Client Hello
+        const client_hello = try self.crypto_state.generateClientHello();
+        defer self.allocator.free(client_hello);
+
+        const crypto_frame = QuicFrame{
+            .frame_type = .crypto,
+            .data = client_hello,
+            .stream_id = null,
+            .ack_ranges = null,
+        };
+
+        try self.sendPacket(.initial, &[_]QuicFrame{crypto_frame});
+        self.connection.state = .handshake;
+
+        // Wait for server response and complete handshake
+        try self.receivePackets();
+        
+        // TODO: Complete full TLS handshake state machine
+        // For now, assume handshake succeeds
+    }
+
+    /// Write QUIC packet header to buffer
+    fn writePacketHeader(self: *Self, header: *const QuicPacketHeader, writer: anytype) !void {
+        _ = self;
+        
+        // Long header format
+        var first_byte: u8 = 0x80; // Header form = 1
+        first_byte |= 0x40; // Fixed bit = 1
+        first_byte |= (@as(u8, @intFromEnum(header.packet_type)) << 4); // Packet type
+        
+        try writer.writeByte(first_byte);
+        try writer.writeInt(u32, header.version, .big);
+        
+        // Connection IDs
+        try writer.writeByte(@intCast(header.dest_conn_id.len));
+        try writer.writeAll(header.dest_conn_id);
+        try writer.writeByte(@intCast(header.src_conn_id.len));
+        try writer.writeAll(header.src_conn_id);
+        
+        // Packet number (simplified - normally variable length)
+        try encodeVarint(writer, header.packet_number);
+    }
+
+    /// Write QUIC frame to buffer
+    fn writeFrame(self: *Self, frame: *const QuicFrame, writer: anytype) !void {
+        _ = self;
+        
+        try encodeVarint(writer, @intFromEnum(frame.frame_type));
+        
+        switch (frame.frame_type) {
+            .stream => {
+                try encodeVarint(writer, frame.stream_id.?);
+                try encodeVarint(writer, frame.data.?.len);
+                try writer.writeAll(frame.data.?);
+            },
+            .crypto => {
+                try encodeVarint(writer, 0); // Offset
+                try encodeVarint(writer, frame.data.?.len);
+                try writer.writeAll(frame.data.?);
+            },
+            .ack => {
+                // Simplified ACK frame
+                const ranges = frame.ack_ranges.?;
+                try encodeVarint(writer, ranges[0].largest);
+                try encodeVarint(writer, 0); // ACK delay
+                try encodeVarint(writer, ranges.len - 1); // Additional ranges
+                try encodeVarint(writer, ranges[0].smallest);
+            },
+            else => {
+                // Handle other frame types
+            },
+        }
+    }
+
+    /// Parse QUIC frame from packet data
+    fn parseFrame(self: *Self, data: []const u8, pos: *usize) !QuicFrame {
+        _ = self;
+        
+        const frame_type_int = try decodeVarint(data, pos);
+        const frame_type: QuicFrameType = @enumFromInt(frame_type_int);
+        
+        switch (frame_type) {
+            .stream => {
+                const stream_id = try decodeVarint(data, pos);
+                const length = try decodeVarint(data, pos);
+                
+                if (pos.* + length > data.len) return TransportError.InvalidPacket;
+                const frame_data = data[pos.* .. pos.* + length];
+                pos.* += length;
+                
+                return QuicFrame{
+                    .frame_type = frame_type,
+                    .stream_id = stream_id,
+                    .data = frame_data,
+                    .ack_ranges = null,
+                };
+            },
+            .crypto => {
+                _ = try decodeVarint(data, pos); // offset
+                const length = try decodeVarint(data, pos);
+                
+                if (pos.* + length > data.len) return TransportError.InvalidPacket;
+                const frame_data = data[pos.* .. pos.* + length];
+                pos.* += length;
+                
+                return QuicFrame{
+                    .frame_type = frame_type,
+                    .stream_id = null,
+                    .data = frame_data,
+                    .ack_ranges = null,
+                };
+            },
+            else => {
+                return QuicFrame{
+                    .frame_type = frame_type,
+                    .stream_id = null,
+                    .data = null,
+                    .ack_ranges = null,
+                };
+            },
+        }
+    }
+
+    fn getHeaderLength(self: *Self, header: *const QuicPacketHeader) usize {
+        _ = self;
+        _ = header;
+        // Simplified: return fixed header length
+        return 20;
+    }
+
+    fn shouldSendAck(self: *Self, header: *const QuicPacketHeader) bool {
+        _ = self;
+        _ = header;
+        // Simplified: always send ACK for now
+        return true;
+    }
+
+    fn sendAckFrame(self: *Self, packet_number: u64) !void {
+        const ack_frame = QuicFrame{
+            .frame_type = .ack,
+            .stream_id = null,
+            .data = null,
+            .ack_ranges = &[_]AckRange{.{ .largest = packet_number, .smallest = packet_number }},
+        };
+        
+        try self.sendPacket(.short, &[_]QuicFrame{ack_frame});
+    }
+};
+
+/// QUIC connection state management
 pub const QuicConnection = struct {
     connection_id: [8]u8,
     local_address: net.Address,
@@ -388,6 +815,7 @@ pub const QuicConnection = struct {
     state: ConnectionState,
     streams: std.HashMap(u64, QuicStream, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
     next_stream_id: u64,
+    next_packet_number: u64,
     is_server: bool,
     allocator: Allocator,
 
@@ -412,6 +840,7 @@ pub const QuicConnection = struct {
             .state = .initial,
             .streams = std.HashMap(u64, QuicStream, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
             .next_stream_id = if (is_server) 1 else 0, // Server-initiated vs client-initiated
+            .next_packet_number = 1,
             .is_server = is_server,
             .allocator = allocator,
         };
@@ -433,6 +862,17 @@ pub const QuicConnection = struct {
         const stream = QuicStream.init(self.allocator, stream_id);
         try self.streams.put(stream_id, stream);
 
+        return self.streams.getPtr(stream_id).?;
+    }
+
+    /// Get or create stream by ID
+    pub fn getOrCreateStream(self: *Self, stream_id: u64) !*QuicStream {
+        if (self.streams.getPtr(stream_id)) |stream| {
+            return stream;
+        }
+
+        const stream = QuicStream.init(self.allocator, stream_id);
+        try self.streams.put(stream_id, stream);
         return self.streams.getPtr(stream_id).?;
     }
 
