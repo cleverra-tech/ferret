@@ -190,6 +190,24 @@ pub fn build(b: *std.Build) void {
     const unified_http_demo_step = b.step("demo-unified-http", "Run unified HTTP API demo");
     unified_http_demo_step.dependOn(&run_unified_http_demo.step);
 
+    // Unicode test
+    const unicode_test = b.addExecutable(.{
+        .name = "unicode_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/unicode_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(unicode_test);
+
+    const run_unicode_test = b.addRunArtifact(unicode_test);
+    const unicode_test_step = b.step("test-unicode", "Run Unicode validation test");
+    unicode_test_step.dependOn(&run_unicode_test.step);
+
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);

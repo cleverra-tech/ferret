@@ -418,28 +418,79 @@ pub const Parser = struct {
         while (i < escaped.len) {
             if (escaped[i] == '\\' and i + 1 < escaped.len) {
                 const next = escaped[i + 1];
-                const unescaped: u8 = switch (next) {
-                    '"' => '"',
-                    '\\' => '\\',
-                    '/' => '/',
-                    'b' => '\u{08}',
-                    'f' => '\u{0C}',
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    'u' => blk: {
+                switch (next) {
+                    '"' => {
+                        try result.append('"');
+                        i += 2;
+                    },
+                    '\\' => {
+                        try result.append('\\');
+                        i += 2;
+                    },
+                    '/' => {
+                        try result.append('/');
+                        i += 2;
+                    },
+                    'b' => {
+                        try result.append('\u{08}');
+                        i += 2;
+                    },
+                    'f' => {
+                        try result.append('\u{0C}');
+                        i += 2;
+                    },
+                    'n' => {
+                        try result.append('\n');
+                        i += 2;
+                    },
+                    'r' => {
+                        try result.append('\r');
+                        i += 2;
+                    },
+                    't' => {
+                        try result.append('\t');
+                        i += 2;
+                    },
+                    'u' => {
                         if (i + 5 >= escaped.len) return ParseError.InvalidEscape;
+
+                        // Parse the 4-digit hex Unicode escape
                         const hex = escaped[i + 2 .. i + 6];
                         const codepoint = std.fmt.parseInt(u16, hex, 16) catch return ParseError.InvalidUnicode;
-                        // TODO: Proper UTF-8 encoding for unicode escapes
-                        if (codepoint > 127) return ParseError.InvalidUnicode;
-                        i += 4; // Skip the 4 hex digits
-                        break :blk @intCast(codepoint);
+                        i += 6; // Skip '\u' + 4 hex digits
+
+                        // Check for UTF-16 surrogate pairs (for codepoints > U+FFFF)
+                        if (codepoint >= 0xD800 and codepoint <= 0xDBFF) {
+                            // High surrogate, expect low surrogate
+                            if (i + 5 >= escaped.len or escaped[i] != '\\' or escaped[i + 1] != 'u') {
+                                return ParseError.InvalidUnicode;
+                            }
+
+                            const low_hex = escaped[i + 2 .. i + 6];
+                            const low_surrogate = std.fmt.parseInt(u16, low_hex, 16) catch return ParseError.InvalidUnicode;
+
+                            if (low_surrogate < 0xDC00 or low_surrogate > 0xDFFF) {
+                                return ParseError.InvalidUnicode;
+                            }
+
+                            // Combine surrogates to get the actual codepoint
+                            const high = @as(u32, codepoint - 0xD800);
+                            const low = @as(u32, low_surrogate - 0xDC00);
+                            const full_codepoint = 0x10000 + (high << 10) + low;
+
+                            // Encode as UTF-8
+                            try self.encodeUtf8Codepoint(&result, full_codepoint);
+                            i += 6; // Skip the second '\u' + 4 hex digits
+                        } else if (codepoint >= 0xDC00 and codepoint <= 0xDFFF) {
+                            // Unexpected low surrogate
+                            return ParseError.InvalidUnicode;
+                        } else {
+                            // Regular BMP codepoint
+                            try self.encodeUtf8Codepoint(&result, @as(u32, codepoint));
+                        }
                     },
                     else => return ParseError.InvalidEscape,
-                };
-                try result.append(unescaped);
-                i += 2;
+                }
             } else {
                 try result.append(escaped[i]);
                 i += 1;
@@ -447,6 +498,34 @@ pub const Parser = struct {
         }
 
         return result.toOwnedSlice();
+    }
+
+    /// Encode a Unicode codepoint as UTF-8 bytes
+    fn encodeUtf8Codepoint(self: *Self, result: *ArrayList(u8), codepoint: u32) ParseError!void {
+        _ = self;
+
+        if (codepoint <= 0x7F) {
+            // 1-byte sequence: 0xxxxxxx
+            try result.append(@intCast(codepoint));
+        } else if (codepoint <= 0x7FF) {
+            // 2-byte sequence: 110xxxxx 10xxxxxx
+            try result.append(@intCast(0xC0 | (codepoint >> 6)));
+            try result.append(@intCast(0x80 | (codepoint & 0x3F)));
+        } else if (codepoint <= 0xFFFF) {
+            // 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx
+            try result.append(@intCast(0xE0 | (codepoint >> 12)));
+            try result.append(@intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+            try result.append(@intCast(0x80 | (codepoint & 0x3F)));
+        } else if (codepoint <= 0x10FFFF) {
+            // 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+            try result.append(@intCast(0xF0 | (codepoint >> 18)));
+            try result.append(@intCast(0x80 | ((codepoint >> 12) & 0x3F)));
+            try result.append(@intCast(0x80 | ((codepoint >> 6) & 0x3F)));
+            try result.append(@intCast(0x80 | (codepoint & 0x3F)));
+        } else {
+            // Invalid codepoint
+            return ParseError.InvalidUnicode;
+        }
     }
 
     fn skipWhitespace(self: *Self) void {
@@ -736,4 +815,127 @@ test "JSON roundtrip" {
 
     const obj = try reparsed.getObject();
     try std.testing.expect(obj.count() == 2);
+}
+
+test "JSON Unicode escape sequences" {
+    const allocator = std.testing.allocator;
+
+    // Test ASCII Unicode escapes
+    {
+        var value = try parseFromString(allocator, "\"\\u0041\""); // 'A'
+        defer value.deinit(allocator);
+        const str = try value.getString();
+        try std.testing.expectEqualStrings("A", str);
+    }
+
+    // Test Latin-1 Unicode escapes
+    {
+        var value = try parseFromString(allocator, "\"\\u00E9\""); // 'é'
+        defer value.deinit(allocator);
+        const str = try value.getString();
+        try std.testing.expectEqualStrings("é", str);
+    }
+
+    // Test BMP Unicode escapes (3-byte UTF-8)
+    {
+        var value = try parseFromString(allocator, "\"\\u20AC\""); // '€' Euro sign
+        defer value.deinit(allocator);
+        const str = try value.getString();
+        try std.testing.expectEqualStrings("€", str);
+    }
+
+    // Test CJK characters
+    {
+        var value = try parseFromString(allocator, "\"\\u4E2D\\u6587\""); // '中文' Chinese
+        defer value.deinit(allocator);
+        const str = try value.getString();
+        try std.testing.expectEqualStrings("中文", str);
+    }
+
+    // Test emoji via surrogate pairs
+    {
+        var value = try parseFromString(allocator, "\"\\uD83D\\uDE00\""); // U+1F600 grinning face
+        defer value.deinit(allocator);
+        const str = try value.getString();
+        // Expected UTF-8 encoding: F0 9F 98 80
+        try std.testing.expect(str.len == 4);
+        try std.testing.expect(str[0] == 0xF0 and str[1] == 0x9F and str[2] == 0x98 and str[3] == 0x80);
+    }
+
+    // Test complex surrogate pair
+    {
+        var value = try parseFromString(allocator, "\"\\uD83C\\uDF89\""); // U+1F389 party popper
+        defer value.deinit(allocator);
+        const str = try value.getString();
+        // Expected UTF-8 encoding: F0 9F 8E 89
+        try std.testing.expect(str.len == 4);
+        try std.testing.expect(str[0] == 0xF0 and str[1] == 0x9F and str[2] == 0x8E and str[3] == 0x89);
+    }
+
+    // Test mixed Unicode and regular characters
+    {
+        var value = try parseFromString(allocator, "\"Hello \\u4E16\\u754C! \\uD83C\\uDF0D\""); // "Hello [Chinese] [Earth]"
+        defer value.deinit(allocator);
+        const str = try value.getString();
+        try std.testing.expect(str.len > 10); // Should be longer than ASCII equivalent
+        try std.testing.expect(std.unicode.utf8ValidateSlice(str)); // Must be valid UTF-8
+    }
+}
+
+test "JSON Unicode error cases" {
+    const allocator = std.testing.allocator;
+
+    // Test invalid hex digits
+    {
+        const result = parseFromString(allocator, "\"\\uGGGG\"");
+        try std.testing.expectError(ParseError.InvalidUnicode, result);
+    }
+
+    // Test incomplete Unicode escape
+    {
+        const result = parseFromString(allocator, "\"\\u123\"");
+        try std.testing.expectError(ParseError.InvalidEscape, result);
+    }
+
+    // Test lone high surrogate
+    {
+        const result = parseFromString(allocator, "\"\\uD800\"");
+        try std.testing.expectError(ParseError.InvalidUnicode, result);
+    }
+
+    // Test lone low surrogate
+    {
+        const result = parseFromString(allocator, "\"\\uDC00\"");
+        try std.testing.expectError(ParseError.InvalidUnicode, result);
+    }
+
+    // Test high surrogate without low surrogate
+    {
+        const result = parseFromString(allocator, "\"\\uD800\\u0041\"");
+        try std.testing.expectError(ParseError.InvalidUnicode, result);
+    }
+
+    // Test high surrogate with invalid low surrogate
+    {
+        const result = parseFromString(allocator, "\"\\uD800\\uD800\"");
+        try std.testing.expectError(ParseError.InvalidUnicode, result);
+    }
+}
+
+test "JSON Unicode benchmark" {
+    const allocator = std.testing.allocator;
+    const count = 1000;
+
+    // Benchmark Unicode parsing
+    const start = std.time.nanoTimestamp();
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        var value = try parseFromString(allocator, "\"\\u4E2D\\u6587\\uD83C\\uDF89\"");
+        defer value.deinit(allocator);
+    }
+    const end = std.time.nanoTimestamp();
+    const duration_ns = end - start;
+    const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
+
+    std.log.info("Unicode parsing benchmark: {} iterations in {d:.2} ms ({d:.2} ns/iter)", .{ count, duration_ms, @as(f64, @floatFromInt(duration_ns)) / @as(f64, @floatFromInt(count)) });
 }
