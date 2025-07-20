@@ -56,6 +56,7 @@ pub const Json = @import("protocols/json.zig");
 pub const hash = @import("crypto/hash.zig");
 pub const cipher = @import("crypto/cipher.zig");
 pub const rand = @import("crypto/rand.zig");
+pub const asymmetric = @import("crypto/asymmetric.zig");
 
 // CLI utilities
 pub const Cli = @import("cli/args.zig").Cli;

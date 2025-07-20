@@ -442,9 +442,9 @@ pub const Message = struct {
     type: MessageType,
     data: []const u8,
     allocator: ?Allocator = null,
-    
+
     const Self = @This();
-    
+
     pub fn deinit(self: *Self) void {
         if (self.allocator) |alloc| {
             alloc.free(self.data);
@@ -460,20 +460,20 @@ pub const Connection = struct {
     is_server: bool,
     message_buffer: std.ArrayList(u8),
     fragmented_type: ?Opcode = null,
-    
+
     // Configuration
     max_message_size: usize = 16 * 1024 * 1024, // 16MB default
     ping_interval_ms: u32 = 30000, // 30 seconds
     close_timeout_ms: u32 = 5000, // 5 seconds
-    
+
     // Statistics
     messages_sent: u64 = 0,
     messages_received: u64 = 0,
     bytes_sent: u64 = 0,
     bytes_received: u64 = 0,
-    
+
     const Self = @This();
-    
+
     pub fn init(allocator: Allocator, is_server: bool) Self {
         return Self{
             .allocator = allocator,
@@ -483,18 +483,18 @@ pub const Connection = struct {
             .message_buffer = std.ArrayList(u8).init(allocator),
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
         self.parser.deinit();
         self.message_buffer.deinit();
     }
-    
+
     /// Handle incoming data and return any complete messages
     pub fn handleData(self: *Self, data: []const u8) ![]Message {
         if (self.state != .connected) {
             return error.ConnectionClosed;
         }
-        
+
         var messages = std.ArrayList(Message).init(self.allocator);
         errdefer {
             for (messages.items) |*msg| {
@@ -502,15 +502,15 @@ pub const Connection = struct {
             }
             messages.deinit();
         }
-        
+
         var remaining = data;
         while (remaining.len > 0) {
             if (try self.parser.parse(remaining)) |frame| {
                 defer if (frame.payload.len > 0) self.allocator.free(frame.payload);
-                
+
                 // Update statistics
                 self.bytes_received += remaining.len;
-                
+
                 // Process frame based on opcode
                 switch (frame.header.opcode) {
                     .text, .binary => {
@@ -551,10 +551,10 @@ pub const Connection = struct {
                         return error.ProtocolError;
                     },
                 }
-                
+
                 // Reset parser for next frame
                 self.parser.reset();
-                
+
                 // Advance remaining data
                 const frame_size = frame.header.header_size + frame.payload.len;
                 remaining = remaining[frame_size..];
@@ -563,87 +563,87 @@ pub const Connection = struct {
                 break;
             }
         }
-        
+
         return messages.toOwnedSlice();
     }
-    
+
     /// Send a text message
     pub fn sendText(self: *Self, text: []const u8) ![]u8 {
         if (self.state != .connected) {
             return error.ConnectionClosed;
         }
-        
+
         const frame = try Frame.text(self.allocator, text, !self.is_server);
         const serialized = try frame.serialize(self.allocator);
-        
+
         self.messages_sent += 1;
         self.bytes_sent += serialized.len;
-        
+
         return serialized;
     }
-    
+
     /// Send a binary message
     pub fn sendBinary(self: *Self, data: []const u8) ![]u8 {
         if (self.state != .connected) {
             return error.ConnectionClosed;
         }
-        
+
         const frame = try Frame.binary(self.allocator, data, !self.is_server);
         const serialized = try frame.serialize(self.allocator);
-        
+
         self.messages_sent += 1;
         self.bytes_sent += serialized.len;
-        
+
         return serialized;
     }
-    
+
     /// Send a ping frame
     pub fn sendPing(self: *Self, data: ?[]const u8) ![]u8 {
         if (self.state != .connected) {
             return error.ConnectionClosed;
         }
-        
+
         const frame = try Frame.ping(self.allocator, data, !self.is_server);
         return try frame.serialize(self.allocator);
     }
-    
+
     /// Send a pong frame (response to ping)
     pub fn sendPong(self: *Self, data: ?[]const u8) ![]u8 {
         if (self.state != .connected) {
             return error.ConnectionClosed;
         }
-        
+
         const frame = try Frame.pong(self.allocator, data, !self.is_server);
         return try frame.serialize(self.allocator);
     }
-    
+
     /// Send a close frame
     pub fn sendClose(self: *Self, code: CloseCode, reason: ?[]const u8) ![]u8 {
         if (self.state == .closed) {
             return error.ConnectionClosed;
         }
-        
+
         self.state = .closing;
-        
+
         // Create close payload: 2-byte code + optional reason
         var payload = std.ArrayList(u8).init(self.allocator);
         defer payload.deinit();
-        
+
         const code_bytes = mem.toBytes(mem.nativeToBig(u16, @intFromEnum(code)));
         try payload.appendSlice(&code_bytes);
-        
+
         if (reason) |r| {
             try payload.appendSlice(r);
         }
-        
+
         const frame = try Frame.close(self.allocator, code, reason, !self.is_server);
         var close_frame = frame;
         close_frame.payload = payload.items;
         close_frame.header.payload_length = payload.items.len;
-        
+
         return try close_frame.serialize(self.allocator);
     }
-    
+
     /// Get connection statistics
     pub fn getStats(self: Self) ConnectionStats {
         return ConnectionStats{
@@ -654,23 +654,23 @@ pub const Connection = struct {
             .state = self.state,
         };
     }
-    
+
     // Private helper methods
-    
+
     fn handleDataFrame(self: *Self, frame: Frame) !?Message {
         if (!frame.header.fin) {
             // Start of fragmented message
             if (self.fragmented_type != null) {
                 return error.ProtocolError; // Already have fragmented message
             }
-            
+
             self.fragmented_type = frame.header.opcode;
             try self.message_buffer.appendSlice(frame.payload);
-            
+
             if (self.message_buffer.items.len > self.max_message_size) {
                 return error.MessageTooLarge;
             }
-            
+
             return null; // Not complete yet
         } else {
             // Complete message
@@ -679,7 +679,7 @@ pub const Connection = struct {
                 .binary => .binary,
                 else => return error.ProtocolError,
             };
-            
+
             const data = try self.allocator.dupe(u8, frame.payload);
             return Message{
                 .type = message_type,
@@ -688,18 +688,18 @@ pub const Connection = struct {
             };
         }
     }
-    
+
     fn handleContinuationFrame(self: *Self, frame: Frame) !?Message {
         if (self.fragmented_type == null) {
             return error.ProtocolError; // No fragmented message in progress
         }
-        
+
         try self.message_buffer.appendSlice(frame.payload);
-        
+
         if (self.message_buffer.items.len > self.max_message_size) {
             return error.MessageTooLarge;
         }
-        
+
         if (frame.header.fin) {
             // Message complete
             const message_type: MessageType = switch (self.fragmented_type.?) {
@@ -707,17 +707,17 @@ pub const Connection = struct {
                 .binary => .binary,
                 else => return error.ProtocolError,
             };
-            
+
             const data = try self.message_buffer.toOwnedSlice();
             self.fragmented_type = null;
-            
+
             return Message{
                 .type = message_type,
                 .data = data,
                 .allocator = self.allocator,
             };
         }
-        
+
         return null; // Still fragmenting
     }
 };
@@ -739,69 +739,69 @@ pub const UpgradeHandler = struct {
         if (!Handshake.validateHandshake(request_headers)) {
             return error.InvalidHandshake;
         }
-        
+
         // Get client key
         const client_key = request_headers.get("sec-websocket-key") orelse return error.MissingKey;
-        
+
         // Generate accept key
         const accept_key = try Handshake.generateAcceptKey(allocator, client_key);
-        
+
         // Check for subprotocols
         const subprotocols = request_headers.get("sec-websocket-protocol");
-        
+
         // Check for extensions
         const extensions = request_headers.get("sec-websocket-extensions");
-        
+
         return UpgradeResponse{
             .accept_key = accept_key,
             .subprotocol = if (subprotocols) |sp| try selectSubprotocol(allocator, sp) else null,
             .extensions = if (extensions) |ext| try selectExtensions(allocator, ext) else null,
         };
     }
-    
+
     /// Generate HTTP response for successful WebSocket upgrade
     pub fn generateResponse(allocator: Allocator, upgrade: UpgradeResponse) ![]u8 {
         var response = std.ArrayList(u8).init(allocator);
         defer response.deinit();
-        
+
         try response.appendSlice("HTTP/1.1 101 Switching Protocols\r\n");
         try response.appendSlice("Upgrade: websocket\r\n");
         try response.appendSlice("Connection: Upgrade\r\n");
-        
+
         try response.appendSlice("Sec-WebSocket-Accept: ");
         try response.appendSlice(upgrade.accept_key);
         try response.appendSlice("\r\n");
-        
+
         if (upgrade.subprotocol) |subproto| {
             try response.appendSlice("Sec-WebSocket-Protocol: ");
             try response.appendSlice(subproto);
             try response.appendSlice("\r\n");
         }
-        
+
         if (upgrade.extensions) |ext| {
             try response.appendSlice("Sec-WebSocket-Extensions: ");
             try response.appendSlice(ext);
             try response.appendSlice("\r\n");
         }
-        
+
         try response.appendSlice("\r\n");
-        
+
         return response.toOwnedSlice();
     }
-    
+
     // TODO: Implement proper subprotocol and extension negotiation
     fn selectSubprotocol(allocator: Allocator, requested: []const u8) ![]const u8 {
         // For now, just return the first requested subprotocol
         _ = allocator;
-        
+
         var iter = std.mem.splitSequence(u8, requested, ",");
         if (iter.next()) |first| {
             return std.mem.trim(u8, first, " \t");
         }
-        
+
         return "";
     }
-    
+
     fn selectExtensions(allocator: Allocator, requested: []const u8) ![]const u8 {
         // For now, don't support any extensions
         _ = allocator;
@@ -815,9 +815,9 @@ pub const UpgradeResponse = struct {
     accept_key: []const u8,
     subprotocol: ?[]const u8 = null,
     extensions: ?[]const u8 = null,
-    
+
     const Self = @This();
-    
+
     pub fn deinit(self: *Self, allocator: Allocator) void {
         allocator.free(self.accept_key);
         if (self.subprotocol) |sp| allocator.free(sp);
@@ -873,7 +873,7 @@ pub const Handshake = struct {
 
         return true;
     }
-    
+
     /// Check if HTTP request is a WebSocket upgrade request
     pub fn isUpgradeRequest(headers: anytype) bool {
         // Check for upgrade header
@@ -1031,15 +1031,15 @@ test "WebSocket parser - fragmented input" {
 test "WebSocket connection - message handling" {
     var connection = Connection.init(testing.allocator, true);
     defer connection.deinit();
-    
+
     // Manually set state to connected for testing
     connection.state = .connected;
-    
+
     // Create test text message frame
     const text_frame = try Frame.text(testing.allocator, "Hello WebSocket!", false);
     const serialized = try text_frame.serialize(testing.allocator);
     defer testing.allocator.free(serialized);
-    
+
     // Handle the data
     const messages = try connection.handleData(serialized);
     defer {
@@ -1049,7 +1049,7 @@ test "WebSocket connection - message handling" {
         }
         testing.allocator.free(messages);
     }
-    
+
     try testing.expect(messages.len == 1);
     try testing.expect(messages[0].type == .text);
     try testing.expectEqualStrings(messages[0].data, "Hello WebSocket!");
@@ -1058,18 +1058,18 @@ test "WebSocket connection - message handling" {
 test "WebSocket connection - send text message" {
     var connection = Connection.init(testing.allocator, false); // Client
     defer connection.deinit();
-    
+
     connection.state = .connected;
-    
+
     const serialized = try connection.sendText("Hello from client!");
     defer testing.allocator.free(serialized);
-    
+
     // Parse the serialized frame to verify
     const header = FrameHeader.parse(serialized).?;
     try testing.expect(header.opcode == .text);
     try testing.expect(header.fin == true);
     try testing.expect(header.masked == true); // Client messages should be masked
-    
+
     const stats = connection.getStats();
     try testing.expect(stats.messages_sent == 1);
 }
@@ -1077,17 +1077,17 @@ test "WebSocket connection - send text message" {
 test "WebSocket connection - ping/pong" {
     var connection = Connection.init(testing.allocator, true); // Server
     defer connection.deinit();
-    
+
     connection.state = .connected;
-    
+
     // Send ping
     const ping_data = try connection.sendPing("ping data");
     defer testing.allocator.free(ping_data);
-    
+
     // Send pong
     const pong_data = try connection.sendPong("pong data");
     defer testing.allocator.free(pong_data);
-    
+
     // Verify ping frame
     const ping_header = FrameHeader.parse(ping_data).?;
     try testing.expect(ping_header.opcode == .ping);
@@ -1097,14 +1097,14 @@ test "WebSocket connection - ping/pong" {
 test "WebSocket connection - close handling" {
     var connection = Connection.init(testing.allocator, true);
     defer connection.deinit();
-    
+
     connection.state = .connected;
-    
+
     const close_data = try connection.sendClose(.normal, "Goodbye");
     defer testing.allocator.free(close_data);
-    
+
     try testing.expect(connection.state == .closing);
-    
+
     const header = FrameHeader.parse(close_data).?;
     try testing.expect(header.opcode == .close);
 }
@@ -1113,18 +1113,18 @@ test "WebSocket upgrade handler - valid handshake" {
     // Create a mock headers map
     var headers = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(testing.allocator);
     defer headers.deinit();
-    
+
     try headers.put("upgrade", "websocket");
     try headers.put("connection", "upgrade");
     try headers.put("sec-websocket-version", "13");
     try headers.put("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
-    
+
     const upgrade_response = try UpgradeHandler.performUpgrade(testing.allocator, headers);
     defer {
         var mut_response = upgrade_response;
         mut_response.deinit(testing.allocator);
     }
-    
+
     // Check that accept key was generated
     try testing.expect(upgrade_response.accept_key.len > 0);
     try testing.expectEqualStrings(upgrade_response.accept_key, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
@@ -1133,11 +1133,11 @@ test "WebSocket upgrade handler - valid handshake" {
 test "WebSocket upgrade handler - invalid handshake" {
     var headers = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(testing.allocator);
     defer headers.deinit();
-    
+
     // Missing required headers
     try headers.put("upgrade", "websocket");
     // Missing connection, version, and key headers
-    
+
     try testing.expectError(error.InvalidHandshake, UpgradeHandler.performUpgrade(testing.allocator, headers));
 }
 
@@ -1148,10 +1148,10 @@ test "WebSocket upgrade handler - response generation" {
         .extensions = null,
     };
     defer upgrade_response.deinit(testing.allocator);
-    
+
     const response = try UpgradeHandler.generateResponse(testing.allocator, upgrade_response);
     defer testing.allocator.free(response);
-    
+
     // Check that response contains required headers
     try testing.expect(mem.indexOf(u8, response, "HTTP/1.1 101 Switching Protocols") != null);
     try testing.expect(mem.indexOf(u8, response, "Upgrade: websocket") != null);
@@ -1163,26 +1163,26 @@ test "WebSocket upgrade handler - response generation" {
 test "WebSocket handshake - upgrade request detection" {
     var headers = std.HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage).init(testing.allocator);
     defer headers.deinit();
-    
+
     // Valid upgrade request
     try headers.put("upgrade", "websocket");
     try headers.put("connection", "upgrade");
-    
+
     try testing.expect(Handshake.isUpgradeRequest(headers) == true);
-    
+
     // Invalid upgrade request
     _ = headers.remove("upgrade");
     try headers.put("upgrade", "http2");
-    
+
     try testing.expect(Handshake.isUpgradeRequest(headers) == false);
 }
 
 test "WebSocket message fragmentation" {
     var connection = Connection.init(testing.allocator, true);
     defer connection.deinit();
-    
+
     connection.state = .connected;
-    
+
     // Create fragmented text message (2 fragments)
     const fragment1_header = FrameHeader{
         .fin = false, // Not final
@@ -1195,7 +1195,7 @@ test "WebSocket message fragmentation" {
         .mask_key = null,
         .header_size = 2,
     };
-    
+
     const fragment2_header = FrameHeader{
         .fin = true, // Final
         .rsv1 = false,
@@ -1207,20 +1207,20 @@ test "WebSocket message fragmentation" {
         .mask_key = null,
         .header_size = 2,
     };
-    
+
     const fragment1 = Frame{ .header = fragment1_header, .payload = "Hello" };
     const fragment2 = Frame{ .header = fragment2_header, .payload = " World" };
-    
+
     const serialized1 = try fragment1.serialize(testing.allocator);
     defer testing.allocator.free(serialized1);
     const serialized2 = try fragment2.serialize(testing.allocator);
     defer testing.allocator.free(serialized2);
-    
+
     // Handle first fragment
     const messages1 = try connection.handleData(serialized1);
     defer testing.allocator.free(messages1);
     try testing.expect(messages1.len == 0); // No complete message yet
-    
+
     // Handle second fragment
     const messages2 = try connection.handleData(serialized2);
     defer {
@@ -1230,7 +1230,7 @@ test "WebSocket message fragmentation" {
         }
         testing.allocator.free(messages2);
     }
-    
+
     try testing.expect(messages2.len == 1);
     try testing.expect(messages2[0].type == .text);
     try testing.expectEqualStrings(messages2[0].data, "Hello World");

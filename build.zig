@@ -388,6 +388,24 @@ pub fn build(b: *std.Build) void {
     const websocket_benchmark_step = b.step("benchmark-websocket", "Run WebSocket connection upgrade and processing benchmark");
     websocket_benchmark_step.dependOn(&run_websocket_benchmark.step);
 
+    // Asymmetric crypto benchmark
+    const asymmetric_crypto_benchmark = b.addExecutable(.{
+        .name = "asymmetric_crypto_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/asymmetric_crypto_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(asymmetric_crypto_benchmark);
+
+    const run_asymmetric_crypto_benchmark = b.addRunArtifact(asymmetric_crypto_benchmark);
+    const asymmetric_crypto_benchmark_step = b.step("benchmark-asymmetric-crypto", "Run asymmetric cryptography performance benchmark");
+    asymmetric_crypto_benchmark_step.dependOn(&run_asymmetric_crypto_benchmark.step);
+
     // HTTP client test
     const http_client_test = b.addExecutable(.{
         .name = "http_client_test",
@@ -436,4 +454,5 @@ pub fn build(b: *std.Build) void {
     benchmark_step.dependOn(&run_cli_benchmark.step);
     benchmark_step.dependOn(&run_config_benchmark.step);
     benchmark_step.dependOn(&run_websocket_benchmark.step);
+    benchmark_step.dependOn(&run_asymmetric_crypto_benchmark.step);
 }
