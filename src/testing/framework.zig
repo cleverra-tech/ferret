@@ -27,7 +27,7 @@ pub const TestCategory = enum {
     pub fn toString(self: TestCategory) []const u8 {
         return switch (self) {
             .unit => "Unit",
-            .integration => "Integration", 
+            .integration => "Integration",
             .performance => "Performance",
             .stress => "Stress",
             .memory => "Memory",
@@ -48,7 +48,7 @@ pub const TestPriority = enum {
         return switch (self) {
             .critical => "Critical",
             .high => "High",
-            .medium => "Medium", 
+            .medium => "Medium",
             .low => "Low",
         };
     }
@@ -115,7 +115,7 @@ pub const TestCase = struct {
     description: []const u8,
     timeout_ms: u32 = 5000,
     enabled: bool = true,
-    
+
     // Result data
     result: TestResult = .skip,
     metrics: ?PerformanceMetrics = null,
@@ -157,7 +157,7 @@ pub const TestSuite = struct {
 
     pub fn runAll(self: *TestSuite) !TestSummary {
         var summary = TestSummary.init(self.allocator);
-        
+
         if (self.setup_fn) |setup| {
             try setup();
         }
@@ -211,11 +211,11 @@ pub const TestSummary = struct {
 
     pub fn addSuite(self: *TestSummary, suite: *TestSuite) !void {
         try self.suites.append(suite);
-        
+
         for (suite.tests.items) |test_case| {
             self.total_tests += 1;
             self.total_duration_ms += test_case.duration_ms();
-            
+
             switch (test_case.result) {
                 .pass => self.passed += 1,
                 .fail => self.failed += 1,
@@ -241,7 +241,7 @@ pub const TestSummary = struct {
         std.debug.print("{}Timeouts: {}\x1b[0m\n", .{ TestResult.timeout.color(), self.timeouts });
         std.debug.print("Success Rate: {d:.2}%\n", .{self.successRate()});
         std.debug.print("Total Duration: {d:.2} ms\n", .{self.total_duration_ms});
-        
+
         // Detailed suite breakdown
         for (self.suites.items) |suite| {
             std.debug.print("\n--- {} Suite ---\n", .{suite.name});
@@ -252,11 +252,11 @@ pub const TestSummary = struct {
                     test_case.name,
                     test_case.duration_ms(),
                 });
-                
+
                 if (test_case.error_message) |msg| {
                     std.debug.print("    Error: {s}\n", .{msg});
                 }
-                
+
                 if (test_case.metrics) |metrics| {
                     std.debug.print("    Metrics: {d:.2} ops/sec, {} memory\n", .{
                         metrics.opsPerSecond(),
@@ -332,7 +332,7 @@ pub const MemoryTracker = struct {
     allocations: std.AutoHashMap(usize, AllocationInfo),
     total_allocated: usize = 0,
     total_freed: usize = 0,
-    
+
     const AllocationInfo = struct {
         size: usize,
         timestamp: i128,
@@ -464,7 +464,7 @@ pub const Assert = struct {
         const start = std.time.nanoTimestamp();
         _ = try func(args);
         const duration = @as(u64, @intCast(std.time.nanoTimestamp() - start));
-        
+
         if (duration > time_limit_ns) {
             std.debug.print("Assertion failed: operation took {}ns but limit was {}ns\n", .{ duration, time_limit_ns });
             return error.AssertionFailed;
@@ -476,7 +476,7 @@ pub const Assert = struct {
 pub fn Mock(comptime T: type) type {
     return struct {
         const Self = @This();
-        
+
         call_count: u32 = 0,
         last_args: ?T = null,
         return_value: ?T = null,
@@ -499,15 +499,15 @@ pub fn Mock(comptime T: type) type {
         pub fn call(self: *Self, args: T) !T {
             self.call_count += 1;
             self.last_args = args;
-            
+
             if (self.should_error) {
                 return self.error_to_return;
             }
-            
+
             if (self.return_value) |value| {
                 return value;
             }
-            
+
             return args; // Default: echo input
         }
 
@@ -539,7 +539,7 @@ test "TestCase basic functionality" {
         .priority = .high,
         .description = "Test description",
     };
-    
+
     try std.testing.expect(std.mem.eql(u8, test_case.name, "example test"));
     try std.testing.expect(test_case.category == .unit);
     try std.testing.expect(test_case.priority == .high);
@@ -548,14 +548,14 @@ test "TestCase basic functionality" {
 test "TestSuite management" {
     var suite = TestSuite.init(std.testing.allocator, "Core Tests", "Tests for core functionality");
     defer suite.deinit();
-    
+
     const test_case = TestCase{
         .name = "test1",
         .category = .unit,
         .priority = .medium,
         .description = "First test",
     };
-    
+
     try suite.addTest(test_case);
     try std.testing.expect(suite.tests.items.len == 1);
 }
@@ -574,10 +574,10 @@ test "Assert utilities" {
 
 test "Mock functionality" {
     var mock = Mock(i32).init();
-    
+
     mock.setReturnValue(42);
     const result = try mock.call(10);
-    
+
     try std.testing.expect(result == 42);
     try std.testing.expect(mock.wasCalled());
     try std.testing.expect(mock.wasCalledWith(10));
@@ -593,7 +593,7 @@ test "PerformanceMetrics calculations" {
         .peak_memory = 2048,
         .iterations = 1000,
     };
-    
+
     try Assert.approximatelyEquals(1000.0, metrics.opsPerSecond(), 0.1);
     try Assert.approximatelyEquals(1_000_000.0, metrics.nsPerOp(), 0.1);
     try Assert.isFalse(metrics.memoryLeaked());

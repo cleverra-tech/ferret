@@ -316,6 +316,24 @@ pub fn build(b: *std.Build) void {
     const cli_benchmark_step = b.step("benchmark-cli", "Run CLI parsing performance benchmark");
     cli_benchmark_step.dependOn(&run_cli_benchmark.step);
 
+    // HTTP client test
+    const http_client_test = b.addExecutable(.{
+        .name = "http_client_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http_client_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(http_client_test);
+
+    const run_http_client_test = b.addRunArtifact(http_client_test);
+    const http_client_test_step = b.step("test-http-client", "Run HTTP client test and benchmark");
+    http_client_test_step.dependOn(&run_http_client_test.step);
+
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);
