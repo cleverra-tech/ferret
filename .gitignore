@@ -17,6 +17,7 @@ benchmark_results/
 
 # Temporary directories and files
 tmp/
+test_build/
 *.tmp
 *.log
 ferret_test
