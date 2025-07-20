@@ -280,6 +280,24 @@ pub fn build(b: *std.Build) void {
     const atomic_benchmark_step = b.step("benchmark-atomic", "Run Atomic operations performance benchmark");
     atomic_benchmark_step.dependOn(&run_atomic_benchmark.step);
 
+    // CLI benchmark
+    const cli_benchmark = b.addExecutable(.{
+        .name = "cli_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/cli_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(cli_benchmark);
+
+    const run_cli_benchmark = b.addRunArtifact(cli_benchmark);
+    const cli_benchmark_step = b.step("benchmark-cli", "Run CLI parsing performance benchmark");
+    cli_benchmark_step.dependOn(&run_cli_benchmark.step);
+
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);
@@ -289,4 +307,5 @@ pub fn build(b: *std.Build) void {
     benchmark_step.dependOn(&run_buffer_benchmark.step);
     benchmark_step.dependOn(&run_socket_benchmark.step);
     benchmark_step.dependOn(&run_atomic_benchmark.step);
+    benchmark_step.dependOn(&run_cli_benchmark.step);
 }

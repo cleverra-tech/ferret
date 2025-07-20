@@ -15,32 +15,32 @@ pub fn main() !void {
 
     try benchmarkAtomicCounter();
     std.log.info("", .{});
-    
+
     try benchmarkLockFreeQueue(allocator);
     std.log.info("", .{});
-    
+
     try benchmarkSpinLock();
-    
+
     std.log.info("\n=== Benchmark Complete ===", .{});
 }
 
 fn benchmarkAtomicCounter() !void {
     const iterations = 1_000_000;
-    
+
     var counter = AtomicCounter.init(0);
-    
+
     const start = std.time.nanoTimestamp();
     for (0..iterations) |_| {
         _ = counter.increment();
     }
     const increment_time = std.time.nanoTimestamp() - start;
-    
+
     const decrement_start = std.time.nanoTimestamp();
     for (0..iterations) |_| {
         _ = counter.decrement();
     }
     const decrement_time = std.time.nanoTimestamp() - decrement_start;
-    
+
     const cas_start = std.time.nanoTimestamp();
     var cas_successes: u32 = 0;
     for (0..iterations) |i| {
@@ -49,11 +49,11 @@ fn benchmarkAtomicCounter() !void {
         }
     }
     const cas_time = std.time.nanoTimestamp() - cas_start;
-    
+
     const increment_ns_per_op = @as(f64, @floatFromInt(increment_time)) / @as(f64, @floatFromInt(iterations));
     const decrement_ns_per_op = @as(f64, @floatFromInt(decrement_time)) / @as(f64, @floatFromInt(iterations));
     const cas_ns_per_op = @as(f64, @floatFromInt(cas_time)) / @as(f64, @floatFromInt(iterations));
-    
+
     std.log.info("AtomicCounter Performance ({} operations):", .{iterations});
     std.log.info("  Increment: {d:.2} ns/op ({d:.2} ops/sec)", .{ increment_ns_per_op, 1_000_000_000.0 / increment_ns_per_op });
     std.log.info("  Decrement: {d:.2} ns/op ({d:.2} ops/sec)", .{ decrement_ns_per_op, 1_000_000_000.0 / decrement_ns_per_op });
@@ -63,18 +63,18 @@ fn benchmarkAtomicCounter() !void {
 
 fn benchmarkLockFreeQueue(allocator: std.mem.Allocator) !void {
     const iterations = 100_000;
-    
+
     // Test basic enqueue/dequeue performance
     var queue = try LockFreeQueue(usize).init(allocator);
     defer queue.deinit();
-    
+
     // Enqueue benchmark
     const enqueue_start = std.time.nanoTimestamp();
     for (0..iterations) |i| {
         try queue.enqueue(i);
     }
     const enqueue_time = std.time.nanoTimestamp() - enqueue_start;
-    
+
     // Dequeue benchmark
     const dequeue_start = std.time.nanoTimestamp();
     var dequeue_count: usize = 0;
@@ -83,11 +83,11 @@ fn benchmarkLockFreeQueue(allocator: std.mem.Allocator) !void {
         dequeue_count += 1;
     }
     const dequeue_time = std.time.nanoTimestamp() - dequeue_start;
-    
+
     // Mixed operations benchmark
     var mixed_queue = try LockFreeQueue(usize).init(allocator);
     defer mixed_queue.deinit();
-    
+
     const mixed_start = std.time.nanoTimestamp();
     for (0..iterations / 2) |i| {
         try mixed_queue.enqueue(i);
@@ -96,11 +96,11 @@ fn benchmarkLockFreeQueue(allocator: std.mem.Allocator) !void {
         _ = mixed_queue.dequeue();
     }
     const mixed_time = std.time.nanoTimestamp() - mixed_start;
-    
+
     const enqueue_ns_per_op = @as(f64, @floatFromInt(enqueue_time)) / @as(f64, @floatFromInt(iterations));
     const dequeue_ns_per_op = @as(f64, @floatFromInt(dequeue_time)) / @as(f64, @floatFromInt(iterations));
     const mixed_ns_per_op = @as(f64, @floatFromInt(mixed_time)) / @as(f64, @floatFromInt(iterations));
-    
+
     std.log.info("LockFreeQueue Performance ({} operations):", .{iterations});
     std.log.info("  Enqueue: {d:.2} ns/op ({d:.2} ops/sec)", .{ enqueue_ns_per_op, 1_000_000_000.0 / enqueue_ns_per_op });
     std.log.info("  Dequeue: {d:.2} ns/op ({d:.2} ops/sec)", .{ dequeue_ns_per_op, 1_000_000_000.0 / dequeue_ns_per_op });
@@ -112,10 +112,10 @@ fn benchmarkLockFreeQueue(allocator: std.mem.Allocator) !void {
 
 fn benchmarkSpinLock() !void {
     const iterations = 1_000_000;
-    
+
     var lock = SpinLock.init();
     var counter: u64 = 0;
-    
+
     const start = std.time.nanoTimestamp();
     for (0..iterations) |_| {
         lock.lock();
@@ -123,7 +123,7 @@ fn benchmarkSpinLock() !void {
         lock.unlock();
     }
     const lock_time = std.time.nanoTimestamp() - start;
-    
+
     const trylock_start = std.time.nanoTimestamp();
     var trylock_successes: u32 = 0;
     for (0..iterations) |_| {
@@ -134,10 +134,10 @@ fn benchmarkSpinLock() !void {
         }
     }
     const trylock_time = std.time.nanoTimestamp() - trylock_start;
-    
+
     const lock_ns_per_op = @as(f64, @floatFromInt(lock_time)) / @as(f64, @floatFromInt(iterations));
     const trylock_ns_per_op = @as(f64, @floatFromInt(trylock_time)) / @as(f64, @floatFromInt(iterations));
-    
+
     std.log.info("SpinLock Performance ({} operations):", .{iterations});
     std.log.info("  Lock/Unlock: {d:.2} ns/op ({d:.2} ops/sec)", .{ lock_ns_per_op, 1_000_000_000.0 / lock_ns_per_op });
     std.log.info("  TryLock: {d:.2} ns/op ({d:.2} ops/sec) - {}/{} successes", .{ trylock_ns_per_op, 1_000_000_000.0 / trylock_ns_per_op, trylock_successes, iterations });

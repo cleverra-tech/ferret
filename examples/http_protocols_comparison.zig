@@ -21,7 +21,7 @@ pub fn main() !void {
     // Protocol overview
     std.log.info("\n--- Protocol Overview ---", .{});
     const protocols = [_]Http.HttpVersion{ .http_1_1, .http_2_0, .http_3_0 };
-    
+
     for (protocols) |protocol| {
         std.log.info("{s}:", .{protocol.toString()});
         std.log.info("  Transport: {s}", .{if (protocol.usesUdp()) "UDP (QUIC)" else "TCP"});
@@ -49,7 +49,7 @@ pub fn main() !void {
 
     // Performance characteristics
     std.log.info("\n--- Performance Characteristics ---", .{});
-    
+
     std.log.info("HTTP/1.1:", .{});
     std.log.info("  [OK] Simple and well-understood", .{});
     std.log.info("  [OK] Wide compatibility", .{});
@@ -75,7 +75,7 @@ pub fn main() !void {
 
     // Latency comparison simulation
     std.log.info("\n--- Latency Comparison (Simulated) ---", .{});
-    
+
     // Simulate connection establishment times
     const conn_times = .{
         .http1 = 150, // TCP handshake + TLS handshake
@@ -98,7 +98,7 @@ pub fn main() !void {
 
     // Use case recommendations
     std.log.info("\n--- Use Case Recommendations ---", .{});
-    
+
     std.log.info("[Mobile] Mobile Applications:", .{});
     std.log.info("  Recommended: HTTP/3", .{});
     std.log.info("  Reason: Connection migration, 0-RTT, reduced latency", .{});
@@ -121,7 +121,7 @@ pub fn main() !void {
 
     // Migration strategy
     std.log.info("\n--- Migration Strategy ---", .{});
-    
+
     std.log.info("Phase 1: HTTP/1.1 → HTTP/2", .{});
     std.log.info("  [OK] Enable HTTP/2 on server", .{});
     std.log.info("  [OK] Update client libraries", .{});
@@ -136,13 +136,13 @@ pub fn main() !void {
 
     // Ferret's approach
     std.log.info("\n--- Ferret's Unified Approach ---", .{});
-    
+
     var client = Http.Client.init(allocator);
     defer client.deinit();
 
     std.log.info("Default protocol: {s}", .{client.default_version.toString()});
     std.log.info("Automatic fallback enabled: HTTP/3 → HTTP/2 → HTTP/1.1", .{});
-    
+
     // Demonstrate protocol selection
     std.log.info("\nProtocol selection logic:", .{});
     const test_scenarios = [_]struct { name: []const u8, available: []const Http.HttpVersion }{
@@ -158,7 +158,7 @@ pub fn main() !void {
 
     // Performance tips
     std.log.info("\n--- Performance Tips ---", .{});
-    
+
     std.log.info("For HTTP/2:", .{});
     std.log.info("  • Combine small files to reduce overhead", .{});
     std.log.info("  • Use server push for critical resources", .{});

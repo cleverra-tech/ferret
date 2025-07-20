@@ -21,7 +21,7 @@ pub fn main() !void {
     // Demonstrate HTTP/2 frame types
     std.log.info("\n--- HTTP/2 Frame Types ---", .{});
     const frame_types = [_]Http2.FrameType{ .data, .headers, .priority, .rst_stream, .settings, .push_promise, .ping, .goaway, .window_update, .continuation };
-    
+
     for (frame_types) |frame_type| {
         std.log.info("{s} (0x{X})", .{ frame_type.toString(), @intFromEnum(frame_type) });
     }
@@ -29,17 +29,17 @@ pub fn main() !void {
     // Demonstrate HTTP/2 error codes
     std.log.info("\n--- HTTP/2 Error Codes ---", .{});
     const error_codes = [_]Http2.ErrorCode{ .no_error, .protocol_error, .internal_error, .flow_control_error, .settings_timeout, .stream_closed, .frame_size_error };
-    
+
     for (error_codes) |error_code| {
         std.log.info("{s} ({})", .{ error_code.toString(), @intFromEnum(error_code) });
     }
 
     // Frame header parsing demonstration
     std.log.info("\n--- HTTP/2 Frame Header Parsing ---", .{});
-    
+
     // Create a HEADERS frame header: length=10, type=HEADERS(1), flags=0x05, stream_id=1
     const header_data = [_]u8{ 0x00, 0x00, 0x0A, 0x01, 0x05, 0x00, 0x00, 0x00, 0x01 };
-    
+
     if (Http2.FrameHeader.parse(&header_data)) |header| {
         std.log.info("Parsed frame header:", .{});
         std.log.info("  Length: {}", .{header.length});
@@ -52,7 +52,7 @@ pub fn main() !void {
 
     // Frame creation demonstration
     std.log.info("\n--- HTTP/2 Frame Creation ---", .{});
-    
+
     // Create DATA frame
     const data_payload = "Hello, HTTP/2 world!";
     const data_frame = Http2.Frame.data(1, data_payload, true);
@@ -123,7 +123,7 @@ pub fn main() !void {
     std.log.info("  Enable push: {}", .{connection.settings.enable_push});
     std.log.info("  Header table size: {}", .{connection.settings.header_table_size});
 
-    // HTTP/2 stream demonstration  
+    // HTTP/2 stream demonstration
     std.log.info("\n--- HTTP/2 Stream Management ---", .{});
     var stream = Http2.Stream.init(allocator, 1);
     defer stream.deinit();
@@ -160,6 +160,6 @@ pub fn main() !void {
     std.log.info("[OK] Server push capabilities", .{});
     std.log.info("[OK] Stream prioritization", .{});
     std.log.info("[OK] Flow control mechanisms", .{});
-    
+
     std.log.info("\n=== HTTP/2 Demo Complete ===", .{});
 }

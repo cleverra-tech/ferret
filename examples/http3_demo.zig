@@ -2,7 +2,7 @@
 //!
 //! This example demonstrates:
 //! - HTTP/3 with QUIC transport
-//! - Automatic protocol negotiation 
+//! - Automatic protocol negotiation
 //! - Multiplexed streams
 //! - 0-RTT connection establishment
 //! - Built-in encryption and security
@@ -31,13 +31,9 @@ pub fn main() !void {
     // Demonstrate different HTTP methods
     std.log.info("\n--- HTTP Method Capabilities ---", .{});
     const methods = [_]Http.Method{ .GET, .POST, .PUT, .DELETE, .HEAD, .OPTIONS };
-    
+
     for (methods) |method| {
-        std.log.info("{s}: safe={}, idempotent={}", .{
-            method.toString(), 
-            method.isSafe(), 
-            method.isIdempotent()
-        });
+        std.log.info("{s}: safe={}, idempotent={}", .{ method.toString(), method.isSafe(), method.isIdempotent() });
     }
 
     // Create a sample request
@@ -65,7 +61,7 @@ pub fn main() !void {
     try response.setHeader("Cache-Control", "max-age=3600");
     response.setBody("{\"users\": [{\"id\": 1, \"name\": \"Alice\"}]}");
 
-    std.log.info("Response status: {} {s}", .{@intFromEnum(response.status), response.status.phrase()});
+    std.log.info("Response status: {} {s}", .{ @intFromEnum(response.status), response.status.phrase() });
     std.log.info("Response version: {s}", .{response.version.toString()});
     std.log.info("Status class: {s}", .{@tagName(response.status.class())});
     std.log.info("Is successful: {}", .{response.isSuccessful()});
@@ -73,29 +69,18 @@ pub fn main() !void {
 
     // Demonstrate status code utilities
     std.log.info("\n--- Status Code Examples ---", .{});
-    const status_codes = [_]Http.StatusCode{ 
-        .ok, .created, .not_found, .internal_server_error, .too_many_requests 
-    };
-    
+    const status_codes = [_]Http.StatusCode{ .ok, .created, .not_found, .internal_server_error, .too_many_requests };
+
     for (status_codes) |status| {
-        std.log.info("{}: {s} (class: {s})", .{
-            @intFromEnum(status), 
-            status.phrase(),
-            @tagName(status.class())
-        });
+        std.log.info("{}: {s} (class: {s})", .{ @intFromEnum(status), status.phrase(), @tagName(status.class()) });
     }
 
     // Demonstrate protocol version comparison
     std.log.info("\n--- Protocol Version Comparison ---", .{});
     const versions = [_]Http.HttpVersion{ .http_1_0, .http_1_1, .http_2_0, .http_3_0 };
-    
+
     for (versions) |version| {
-        std.log.info("{s}: multiplexing={}, encryption={}, udp={}", .{
-            version.toString(),
-            version.supportsMultiplexing(),
-            version.requiresEncryption(),
-            version.usesUdp()
-        });
+        std.log.info("{s}: multiplexing={}, encryption={}, udp={}", .{ version.toString(), version.supportsMultiplexing(), version.requiresEncryption(), version.usesUdp() });
     }
 
     // Simulate protocol negotiation

@@ -12,13 +12,13 @@ pub fn main() !void {
 
     // Test various Unicode scenarios
     const test_cases = [_]struct { input: []const u8, expected_bytes: []const u8 }{
-        .{ .input = "\"\\u0041\"", .expected_bytes = "A" },                    // ASCII
-        .{ .input = "\"\\u00E9\"", .expected_bytes = "é" },                    // Latin-1 supplement
-        .{ .input = "\"\\u20AC\"", .expected_bytes = "€" },                    // Euro sign (BMP)
-        .{ .input = "\"\\u4E2D\\u6587\"", .expected_bytes = "中文" },          // Chinese characters
-        .{ .input = "\"\\uD83D\\uDE00\"", .expected_bytes = &[_]u8{0xF0, 0x9F, 0x98, 0x80} }, // U+1F600 grinning face
-        .{ .input = "\"\\uD83C\\uDF89\"", .expected_bytes = &[_]u8{0xF0, 0x9F, 0x8E, 0x89} }, // U+1F389 party popper  
-        .{ .input = "\"\\u4E16\\u754C\"", .expected_bytes = "世界" },         // World in Chinese
+        .{ .input = "\"\\u0041\"", .expected_bytes = "A" }, // ASCII
+        .{ .input = "\"\\u00E9\"", .expected_bytes = "é" }, // Latin-1 supplement
+        .{ .input = "\"\\u20AC\"", .expected_bytes = "€" }, // Euro sign (BMP)
+        .{ .input = "\"\\u4E2D\\u6587\"", .expected_bytes = "中文" }, // Chinese characters
+        .{ .input = "\"\\uD83D\\uDE00\"", .expected_bytes = &[_]u8{ 0xF0, 0x9F, 0x98, 0x80 } }, // U+1F600 grinning face
+        .{ .input = "\"\\uD83C\\uDF89\"", .expected_bytes = &[_]u8{ 0xF0, 0x9F, 0x8E, 0x89 } }, // U+1F389 party popper
+        .{ .input = "\"\\u4E16\\u754C\"", .expected_bytes = "世界" }, // World in Chinese
     };
 
     std.log.info("Running {} Unicode test cases...", .{test_cases.len});
@@ -38,7 +38,7 @@ pub fn main() !void {
         if (std.mem.eql(u8, str, test_case.expected_bytes)) {
             std.log.info("[OK] Test {}: '{s}' -> UTF-8 bytes match", .{ i + 1, test_case.input });
         } else {
-            std.log.err("[FAIL] Test {}: UTF-8 bytes mismatch", .{ i + 1 });
+            std.log.err("[FAIL] Test {}: UTF-8 bytes mismatch", .{i + 1});
         }
     }
 
@@ -67,7 +67,7 @@ pub fn main() !void {
     var test_value = try json.parseFromString(allocator, "\"\\uD83D\\uDE00\"");
     defer test_value.deinit(allocator);
     const unicode_str = try test_value.getString();
-    
+
     // Check that the result is valid UTF-8
     if (std.unicode.utf8ValidateSlice(unicode_str)) {
         std.log.info("[OK] Generated UTF-8 is valid", .{});

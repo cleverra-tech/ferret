@@ -93,27 +93,18 @@ pub fn main() !void {
 
     // Status code demonstrations
     std.log.info("\n--- Status Code Handling ---", .{});
-    const status_examples = [_]Http.StatusCode{
-        .ok, .created, .accepted, .no_content,
-        .moved_permanently, .found, .not_modified,
-        .bad_request, .unauthorized, .forbidden, .not_found,
-        .internal_server_error, .bad_gateway, .service_unavailable
-    };
+    const status_examples = [_]Http.StatusCode{ .ok, .created, .accepted, .no_content, .moved_permanently, .found, .not_modified, .bad_request, .unauthorized, .forbidden, .not_found, .internal_server_error, .bad_gateway, .service_unavailable };
 
     for (status_examples) |status| {
         var test_response = Http.Response.init(allocator, status);
         defer test_response.deinit();
 
-        std.log.info("{}: {s} ({s})", .{
-            @intFromEnum(status),
-            status.phrase(),
-            @tagName(status.class())
-        });
+        std.log.info("{}: {s} ({s})", .{ @intFromEnum(status), status.phrase(), @tagName(status.class()) });
     }
 
     // Protocol negotiation simulation
     std.log.info("\n--- Protocol Negotiation Simulation ---", .{});
-    
+
     const scenarios = [_]struct {
         name: []const u8,
         server_support: []const Http.HttpVersion,
@@ -141,14 +132,12 @@ pub fn main() !void {
         std.log.info("{s}:", .{scenario.name});
         std.log.info("  Server supports: {s}", .{scenario.server_support[0].toString()});
         std.log.info("  Negotiated: {s}", .{negotiated.toString()});
-        std.log.info("  Benefits: {s}", .{
-            switch (negotiated) {
-                .http_3_0 => "0-RTT, no HOL blocking, migration",
-                .http_2_0 => "Multiplexing, header compression, server push",
-                .http_1_1 => "Wide compatibility, simplicity",
-                else => "Basic HTTP functionality",
-            }
-        });
+        std.log.info("  Benefits: {s}", .{switch (negotiated) {
+            .http_3_0 => "0-RTT, no HOL blocking, migration",
+            .http_2_0 => "Multiplexing, header compression, server push",
+            .http_1_1 => "Wide compatibility, simplicity",
+            else => "Basic HTTP functionality",
+        }});
     }
 
     // Headers demonstration
