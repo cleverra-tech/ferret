@@ -370,6 +370,24 @@ pub fn build(b: *std.Build) void {
     const config_benchmark_step = b.step("benchmark-config", "Run configuration system performance benchmark");
     config_benchmark_step.dependOn(&run_config_benchmark.step);
 
+    // WebSocket benchmark
+    const websocket_benchmark = b.addExecutable(.{
+        .name = "websocket_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/websocket_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(websocket_benchmark);
+
+    const run_websocket_benchmark = b.addRunArtifact(websocket_benchmark);
+    const websocket_benchmark_step = b.step("benchmark-websocket", "Run WebSocket connection upgrade and processing benchmark");
+    websocket_benchmark_step.dependOn(&run_websocket_benchmark.step);
+
     // HTTP client test
     const http_client_test = b.addExecutable(.{
         .name = "http_client_test",
@@ -417,4 +435,5 @@ pub fn build(b: *std.Build) void {
     benchmark_step.dependOn(&run_atomic_benchmark.step);
     benchmark_step.dependOn(&run_cli_benchmark.step);
     benchmark_step.dependOn(&run_config_benchmark.step);
+    benchmark_step.dependOn(&run_websocket_benchmark.step);
 }
