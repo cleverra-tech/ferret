@@ -16,6 +16,9 @@ pub const Array = @import("collections/array.zig").Array;
 pub const HashMap = @import("collections/hashmap.zig").HashMap;
 pub const String = @import("collections/string.zig").String;
 pub const Queue = @import("collections/queue.zig").Queue;
+pub const collections = struct {
+    pub const queue = @import("collections/queue.zig");
+};
 
 // I/O and networking
 pub const Reactor = @import("io/reactor.zig").Reactor;
