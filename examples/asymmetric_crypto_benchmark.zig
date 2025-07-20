@@ -70,9 +70,25 @@ fn benchmarkKeyGeneration() !void {
         print("   Average time per key: {d:.2} μs\n", .{@as(f64, @floatFromInt(duration)) / (ITERATIONS * 1000.0)});
     }
 
-    // Ed25519 Key Generation - TODO: Fix Ed25519 implementation
+    // Ed25519 Key Generation
     {
-        print("   Ed25519 key generation: TODO - implementation pending\n\n", .{});
+        // Warmup
+        for (0..WARMUP_ITERATIONS) |_| {
+            _ = ferret.asymmetric.Ed25519.generateKeyPair() catch unreachable;
+        }
+        
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        for (0..ITERATIONS) |_| {
+            _ = ferret.asymmetric.Ed25519.generateKeyPair() catch unreachable;
+        }
+        const end_time = std.time.nanoTimestamp();
+        
+        const duration = end_time - start_time;
+        const ops_per_sec = (@as(f64, ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
+        
+        print("   Ed25519 key generation: {d:.2} ops/sec\n", .{ops_per_sec});
+        print("   Average time per key: {d:.2} μs\n\n", .{@as(f64, @floatFromInt(duration)) / (ITERATIONS * 1000.0)});
     }
 }
 
@@ -107,9 +123,52 @@ fn benchmarkDigitalSignatures() !void {
     print("3. Digital Signature Performance\n", .{});
     print("   ===============================\n", .{});
 
-    // TODO: Re-enable when Ed25519 implementation is fixed
-    print("   Ed25519 signing: TODO - implementation pending\n", .{});
-    print("   Ed25519 verification: TODO - implementation pending\n\n", .{});
+    const keypair = try ferret.asymmetric.Ed25519.generateKeyPair();
+    const message = "This is a test message for digital signature benchmarking";
+    
+    // Signing Performance
+    {
+        // Warmup
+        for (0..WARMUP_ITERATIONS) |_| {
+            _ = keypair.private_key.sign(message) catch unreachable;
+        }
+        
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        for (0..SIGNATURE_ITERATIONS) |_| {
+            _ = keypair.private_key.sign(message) catch unreachable;
+        }
+        const end_time = std.time.nanoTimestamp();
+        
+        const duration = end_time - start_time;
+        const ops_per_sec = (@as(f64, SIGNATURE_ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
+        
+        print("   Ed25519 signing: {d:.2} ops/sec\n", .{ops_per_sec});
+        print("   Average time per signature: {d:.2} μs\n", .{@as(f64, @floatFromInt(duration)) / (SIGNATURE_ITERATIONS * 1000.0)});
+    }
+
+    // Verification Performance
+    {
+        const signature = try keypair.private_key.sign(message);
+        
+        // Warmup
+        for (0..WARMUP_ITERATIONS) |_| {
+            _ = keypair.public_key.verify(signature, message);
+        }
+        
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        for (0..SIGNATURE_ITERATIONS) |_| {
+            _ = keypair.public_key.verify(signature, message);
+        }
+        const end_time = std.time.nanoTimestamp();
+        
+        const duration = end_time - start_time;
+        const ops_per_sec = (@as(f64, SIGNATURE_ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
+        
+        print("   Ed25519 verification: {d:.2} ops/sec\n", .{ops_per_sec});
+        print("   Average time per verification: {d:.2} μs\n\n", .{@as(f64, @floatFromInt(duration)) / (SIGNATURE_ITERATIONS * 1000.0)});
+    }
 }
 
 fn benchmarkKeyDerivation(allocator: std.mem.Allocator) !void {
@@ -172,9 +231,27 @@ fn benchmarkKeyManagement(allocator: std.mem.Allocator) !void {
         print("   Average time: {d:.2} μs\n", .{@as(f64, @floatFromInt(duration)) / (ITERATIONS * 1000.0)});
     }
 
-    // Signature Workflow - TODO: Fix Ed25519
+    // Signature Workflow
     {
-        print("   KeyManager Ed25519 generation: TODO - implementation pending\n\n", .{});
+        // Warmup
+        for (0..WARMUP_ITERATIONS) |_| {
+            var keypair = ferret.asymmetric.KeyManager.SignatureKeyPair.generate(allocator, .ed25519) catch unreachable;
+            keypair.deinit();
+        }
+        
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        for (0..ITERATIONS) |_| {
+            var keypair = ferret.asymmetric.KeyManager.SignatureKeyPair.generate(allocator, .ed25519) catch unreachable;
+            keypair.deinit();
+        }
+        const end_time = std.time.nanoTimestamp();
+        
+        const duration = end_time - start_time;
+        const ops_per_sec = (@as(f64, ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
+        
+        print("   KeyManager Ed25519 generation: {d:.2} ops/sec\n", .{ops_per_sec});
+        print("   Average time: {d:.2} μs\n\n", .{@as(f64, @floatFromInt(duration)) / (ITERATIONS * 1000.0)});
     }
 }
 

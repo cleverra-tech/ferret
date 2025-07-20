@@ -32,21 +32,21 @@ pub const AsymmetricError = error{
 /// Key exchange algorithms
 pub const KeyExchangeAlgorithm = enum {
     x25519,
-    
+
     /// Get private key length for this algorithm
     pub fn privateKeyLength(self: KeyExchangeAlgorithm) u8 {
         return switch (self) {
             .x25519 => 32,
         };
     }
-    
+
     /// Get public key length for this algorithm
     pub fn publicKeyLength(self: KeyExchangeAlgorithm) u8 {
         return switch (self) {
             .x25519 => 32,
         };
     }
-    
+
     /// Get shared secret length for this algorithm
     pub fn sharedSecretLength(self: KeyExchangeAlgorithm) u8 {
         return switch (self) {
@@ -59,7 +59,7 @@ pub const KeyExchangeAlgorithm = enum {
 pub const SignatureAlgorithm = enum {
     ed25519,
     ecdsa_secp256k1,
-    
+
     /// Get private key length for this algorithm
     pub fn privateKeyLength(self: SignatureAlgorithm) u8 {
         return switch (self) {
@@ -67,7 +67,7 @@ pub const SignatureAlgorithm = enum {
             .ecdsa_secp256k1 => 32,
         };
     }
-    
+
     /// Get public key length for this algorithm
     pub fn publicKeyLength(self: SignatureAlgorithm) u8 {
         return switch (self) {
@@ -75,7 +75,7 @@ pub const SignatureAlgorithm = enum {
             .ecdsa_secp256k1 => 33, // Compressed format
         };
     }
-    
+
     /// Get signature length for this algorithm
     pub fn signatureLength(self: SignatureAlgorithm) u8 {
         return switch (self) {
@@ -91,21 +91,21 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
         /// Private key
         pub const PrivateKey = struct {
             bytes: [algorithm.privateKeyLength()]u8,
-            
+
             const Self = @This();
-            
+
             /// Generate new private key
             pub fn generate() Self {
                 var key: Self = undefined;
                 crypto.random.bytes(&key.bytes);
                 return key;
             }
-            
+
             /// Create private key from bytes
             pub fn fromBytes(bytes: [algorithm.privateKeyLength()]u8) Self {
                 return Self{ .bytes = bytes };
             }
-            
+
             /// Create private key from slice
             pub fn fromSlice(data: []const u8) AsymmetricError!Self {
                 if (data.len != algorithm.privateKeyLength()) {
@@ -115,12 +115,12 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                 @memcpy(&key.bytes, data);
                 return key;
             }
-            
+
             /// Get private key as byte slice
             pub fn slice(self: *const Self) []const u8 {
                 return &self.bytes;
             }
-            
+
             /// Derive public key from private key
             pub fn publicKey(self: *const Self) AsymmetricError!PublicKey {
                 switch (algorithm) {
@@ -132,7 +132,7 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                     },
                 }
             }
-            
+
             /// Perform key exchange to generate shared secret
             pub fn exchange(self: *const Self, peer_public: PublicKey) AsymmetricError!SharedSecret {
                 switch (algorithm) {
@@ -144,24 +144,24 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                     },
                 }
             }
-            
+
             /// Securely clear private key from memory
             pub fn clear(self: *Self) void {
                 @memset(&self.bytes, 0);
             }
         };
-        
+
         /// Public key
         pub const PublicKey = struct {
             bytes: [algorithm.publicKeyLength()]u8,
-            
+
             const Self = @This();
-            
+
             /// Create public key from bytes
             pub fn fromBytes(bytes: [algorithm.publicKeyLength()]u8) Self {
                 return Self{ .bytes = bytes };
             }
-            
+
             /// Create public key from slice
             pub fn fromSlice(data: []const u8) AsymmetricError!Self {
                 if (data.len != algorithm.publicKeyLength()) {
@@ -171,12 +171,12 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                 @memcpy(&key.bytes, data);
                 return key;
             }
-            
+
             /// Get public key as byte slice
             pub fn slice(self: *const Self) []const u8 {
                 return &self.bytes;
             }
-            
+
             /// Encode public key as hexadecimal
             pub fn hex(self: *const Self, allocator: Allocator) ![]u8 {
                 const hex_chars = "0123456789abcdef";
@@ -187,7 +187,7 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                 }
                 return result;
             }
-            
+
             /// Parse public key from hexadecimal
             pub fn fromHex(hex_str: []const u8) AsymmetricError!Self {
                 if (hex_str.len != algorithm.publicKeyLength() * 2) {
@@ -200,32 +200,32 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                 return key;
             }
         };
-        
+
         /// Shared secret from key exchange
         pub const SharedSecret = struct {
             bytes: [algorithm.sharedSecretLength()]u8,
-            
+
             const Self = @This();
-            
+
             /// Create shared secret from bytes
             pub fn fromBytes(bytes: [algorithm.sharedSecretLength()]u8) Self {
                 return Self{ .bytes = bytes };
             }
-            
+
             /// Get shared secret as byte slice
             pub fn slice(self: *const Self) []const u8 {
                 return &self.bytes;
             }
-            
+
             /// Derive symmetric key from shared secret using HKDF
             pub fn deriveKey(self: *const Self, allocator: Allocator, info: []const u8, length: usize) ![]u8 {
                 // TODO: Implement proper HKDF when available in std.crypto
                 // For now, use HMAC-based key derivation
                 const hash = @import("hash.zig");
-                
+
                 // Use shared secret as HMAC key, info as data
                 const hmac_result = hash.MacAuth.hmacSha256(self.slice(), info);
-                
+
                 if (length <= 32) {
                     const result = try allocator.alloc(u8, length);
                     @memcpy(result, hmac_result.slice()[0..length]);
@@ -235,32 +235,32 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                     const result = try allocator.alloc(u8, length);
                     var offset: usize = 0;
                     var counter: u8 = 1;
-                    
+
                     while (offset < length) {
                         var hmac_input = std.ArrayList(u8).init(allocator);
                         defer hmac_input.deinit();
-                        
+
                         try hmac_input.appendSlice(info);
                         try hmac_input.append(counter);
-                        
+
                         const hmac_result_round = hash.MacAuth.hmacSha256(self.slice(), hmac_input.items);
                         const copy_len = @min(32, length - offset);
-                        @memcpy(result[offset..offset + copy_len], hmac_result_round.slice()[0..copy_len]);
-                        
+                        @memcpy(result[offset .. offset + copy_len], hmac_result_round.slice()[0..copy_len]);
+
                         offset += copy_len;
                         counter += 1;
                     }
-                    
+
                     return result;
                 }
             }
-            
+
             /// Securely clear shared secret from memory
             pub fn clear(self: *Self) void {
                 @memset(&self.bytes, 0);
             }
         };
-        
+
         /// Generate a new key pair
         pub fn generateKeyPair() AsymmetricError!struct { private_key: PrivateKey, public_key: PublicKey } {
             const private_key = PrivateKey.generate();
@@ -276,22 +276,16 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
         /// Private signing key
         pub const PrivateKey = struct {
             bytes: [algorithm.privateKeyLength()]u8,
-            
+
             const Self = @This();
-            
+
             /// Generate new private key
             pub fn generate() Self {
                 switch (algorithm) {
                     .ed25519 => {
-                        // For Ed25519, we need to generate a proper key using the seed method
-                        var seed: [32]u8 = undefined;
-                        crypto.random.bytes(&seed);
-                        
-                        // Create the 64-byte secret key from the 32-byte seed using SHA-512
-                        var hash_result: [64]u8 = undefined;
-                        crypto.hash.sha2.Sha512.hash(&seed, &hash_result, .{});
-                        
-                        return Self{ .bytes = hash_result };
+                        // Use Zig's built-in Ed25519 key generation
+                        const keypair = crypto.sign.Ed25519.KeyPair.generate();
+                        return Self{ .bytes = keypair.secret_key.bytes };
                     },
                     .ecdsa_secp256k1 => {
                         var key: Self = undefined;
@@ -300,12 +294,12 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                     },
                 }
             }
-            
+
             /// Create private key from bytes
             pub fn fromBytes(bytes: [algorithm.privateKeyLength()]u8) Self {
                 return Self{ .bytes = bytes };
             }
-            
+
             /// Create private key from slice
             pub fn fromSlice(data: []const u8) AsymmetricError!Self {
                 if (data.len != algorithm.privateKeyLength()) {
@@ -315,12 +309,12 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                 @memcpy(&key.bytes, data);
                 return key;
             }
-            
+
             /// Get private key as byte slice
             pub fn slice(self: *const Self) []const u8 {
                 return &self.bytes;
             }
-            
+
             /// Derive public key from private key
             pub fn publicKey(self: *const Self) AsymmetricError!PublicKey {
                 switch (algorithm) {
@@ -339,7 +333,7 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                     },
                 }
             }
-            
+
             /// Sign message
             pub fn sign(self: *const Self, message: []const u8) AsymmetricError!SignatureValue {
                 switch (algorithm) {
@@ -361,24 +355,24 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                     },
                 }
             }
-            
+
             /// Securely clear private key from memory
             pub fn clear(self: *Self) void {
                 @memset(&self.bytes, 0);
             }
         };
-        
+
         /// Public verification key
         pub const PublicKey = struct {
             bytes: [algorithm.publicKeyLength()]u8,
-            
+
             const Self = @This();
-            
+
             /// Create public key from bytes
             pub fn fromBytes(bytes: [algorithm.publicKeyLength()]u8) Self {
                 return Self{ .bytes = bytes };
             }
-            
+
             /// Create public key from slice
             pub fn fromSlice(data: []const u8) AsymmetricError!Self {
                 if (data.len != algorithm.publicKeyLength()) {
@@ -388,12 +382,12 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                 @memcpy(&key.bytes, data);
                 return key;
             }
-            
+
             /// Get public key as byte slice
             pub fn slice(self: *const Self) []const u8 {
                 return &self.bytes;
             }
-            
+
             /// Verify signature
             pub fn verify(self: *const Self, signature: SignatureValue, message: []const u8) bool {
                 switch (algorithm) {
@@ -413,7 +407,7 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                     },
                 }
             }
-            
+
             /// Encode public key as hexadecimal
             pub fn hex(self: *const Self, allocator: Allocator) ![]u8 {
                 const hex_chars = "0123456789abcdef";
@@ -424,7 +418,7 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                 }
                 return result;
             }
-            
+
             /// Parse public key from hexadecimal
             pub fn fromHex(hex_str: []const u8) AsymmetricError!Self {
                 if (hex_str.len != algorithm.publicKeyLength() * 2) {
@@ -437,18 +431,18 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                 return key;
             }
         };
-        
+
         /// Digital signature value
         pub const SignatureValue = struct {
             bytes: [algorithm.signatureLength()]u8,
-            
+
             const Self = @This();
-            
+
             /// Create signature from bytes
             pub fn fromBytes(bytes: [algorithm.signatureLength()]u8) Self {
                 return Self{ .bytes = bytes };
             }
-            
+
             /// Create signature from slice
             pub fn fromSlice(data: []const u8) AsymmetricError!Self {
                 if (data.len != algorithm.signatureLength()) {
@@ -458,12 +452,12 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                 @memcpy(&signature.bytes, data);
                 return signature;
             }
-            
+
             /// Get signature as byte slice
             pub fn slice(self: *const Self) []const u8 {
                 return &self.bytes;
             }
-            
+
             /// Encode signature as hexadecimal
             pub fn hex(self: *const Self, allocator: Allocator) ![]u8 {
                 const hex_chars = "0123456789abcdef";
@@ -474,7 +468,7 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                 }
                 return result;
             }
-            
+
             /// Parse signature from hexadecimal
             pub fn fromHex(hex_str: []const u8) AsymmetricError!Self {
                 if (hex_str.len != algorithm.signatureLength() * 2) {
@@ -487,17 +481,15 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                 return signature;
             }
         };
-        
+
         /// Generate a new signing key pair
         pub fn generateKeyPair() AsymmetricError!struct { private_key: PrivateKey, public_key: PublicKey } {
             switch (algorithm) {
                 .ed25519 => {
-                    // Use Zig's createSeed function for proper Ed25519 key generation
-                    var seed: [32]u8 = undefined;
-                    crypto.random.bytes(&seed);
-                    
-                    const private_key = PrivateKey.generate();
-                    const public_key = try private_key.publicKey();
+                    // Use Zig's built-in Ed25519 key pair generation
+                    const keypair = crypto.sign.Ed25519.KeyPair.generate();
+                    const private_key = PrivateKey.fromBytes(keypair.secret_key.bytes);
+                    const public_key = PublicKey.fromBytes(keypair.public_key.bytes);
                     return .{ .private_key = private_key, .public_key = public_key };
                 },
                 .ecdsa_secp256k1 => {
@@ -527,9 +519,9 @@ pub const KeyManager = struct {
         private_key: []u8,
         public_key: []u8,
         allocator: Allocator,
-        
+
         const Self = @This();
-        
+
         /// Generate new key exchange key pair
         pub fn generate(allocator: Allocator, algorithm: KeyExchangeAlgorithm) !Self {
             switch (algorithm) {
@@ -537,7 +529,7 @@ pub const KeyManager = struct {
                     const keypair = try X25519.generateKeyPair();
                     const private_key = try allocator.dupe(u8, keypair.private_key.slice());
                     const public_key = try allocator.dupe(u8, keypair.public_key.slice());
-                    
+
                     return Self{
                         .algorithm = algorithm,
                         .private_key = private_key,
@@ -547,7 +539,7 @@ pub const KeyManager = struct {
                 },
             }
         }
-        
+
         /// Perform key exchange
         pub fn exchange(self: *const Self, peer_public_key: []const u8) ![]u8 {
             switch (self.algorithm) {
@@ -555,12 +547,12 @@ pub const KeyManager = struct {
                     const private = try X25519.PrivateKey.fromSlice(self.private_key);
                     const peer_public = try X25519.PublicKey.fromSlice(peer_public_key);
                     const shared_secret = try private.exchange(peer_public);
-                    
+
                     return self.allocator.dupe(u8, shared_secret.slice());
                 },
             }
         }
-        
+
         /// Cleanup allocated memory
         pub fn deinit(self: *Self) void {
             // Clear sensitive data
@@ -569,16 +561,16 @@ pub const KeyManager = struct {
             self.allocator.free(self.public_key);
         }
     };
-    
+
     /// Generate and store a key pair for digital signatures
     pub const SignatureKeyPair = struct {
         algorithm: SignatureAlgorithm,
         private_key: []u8,
         public_key: []u8,
         allocator: Allocator,
-        
+
         const Self = @This();
-        
+
         /// Generate new signature key pair
         pub fn generate(allocator: Allocator, algorithm: SignatureAlgorithm) !Self {
             switch (algorithm) {
@@ -586,7 +578,7 @@ pub const KeyManager = struct {
                     const keypair = try Ed25519.generateKeyPair();
                     const private_key = try allocator.dupe(u8, keypair.private_key.slice());
                     const public_key = try allocator.dupe(u8, keypair.public_key.slice());
-                    
+
                     return Self{
                         .algorithm = algorithm,
                         .private_key = private_key,
@@ -599,14 +591,14 @@ pub const KeyManager = struct {
                 },
             }
         }
-        
+
         /// Sign message
         pub fn sign(self: *const Self, message: []const u8) ![]u8 {
             switch (self.algorithm) {
                 .ed25519 => {
                     const private = try Ed25519.PrivateKey.fromSlice(self.private_key);
                     const signature = try private.sign(message);
-                    
+
                     return self.allocator.dupe(u8, signature.slice());
                 },
                 .ecdsa_secp256k1 => {
@@ -614,7 +606,7 @@ pub const KeyManager = struct {
                 },
             }
         }
-        
+
         /// Cleanup allocated memory
         pub fn deinit(self: *Self) void {
             // Clear sensitive data
@@ -630,11 +622,11 @@ test "X25519 - key exchange" {
     // Generate two key pairs
     const alice_keypair = try X25519.generateKeyPair();
     const bob_keypair = try X25519.generateKeyPair();
-    
+
     // Perform key exchange
     const alice_shared = try alice_keypair.private_key.exchange(bob_keypair.public_key);
     const bob_shared = try bob_keypair.private_key.exchange(alice_keypair.public_key);
-    
+
     // Shared secrets should be equal
     try testing.expectEqualSlices(u8, alice_shared.slice(), bob_shared.slice());
 }
@@ -642,54 +634,53 @@ test "X25519 - key exchange" {
 test "X25519 - key derivation" {
     const keypair = try X25519.generateKeyPair();
     const peer_keypair = try X25519.generateKeyPair();
-    
+
     const shared_secret = try keypair.private_key.exchange(peer_keypair.public_key);
-    
+
     // Derive symmetric keys
     const key1 = try shared_secret.deriveKey(testing.allocator, "test-context", 32);
     defer testing.allocator.free(key1);
-    
+
     const key2 = try shared_secret.deriveKey(testing.allocator, "test-context", 32);
     defer testing.allocator.free(key2);
-    
+
     // Should be deterministic
     try testing.expectEqualSlices(u8, key1, key2);
-    
+
     // Different context should produce different key
     const key3 = try shared_secret.deriveKey(testing.allocator, "different-context", 32);
     defer testing.allocator.free(key3);
-    
+
     try testing.expect(!mem.eql(u8, key1, key3));
 }
 
 test "Ed25519 - signing and verification" {
-    // TODO: Fix Ed25519 key generation
-    // const keypair = try Ed25519.generateKeyPair();
-    // const message = "Hello, digital signatures!";
-    // 
-    // // Sign message
-    // const signature = try keypair.private_key.sign(message);
-    // 
-    // // Verify signature
-    // try testing.expect(keypair.public_key.verify(signature, message));
-    // 
-    // // Verification should fail with different message
-    // try testing.expect(!keypair.public_key.verify(signature, "Different message"));
-    // 
-    // // Verification should fail with wrong public key
-    // const other_keypair = try Ed25519.generateKeyPair();
-    // try testing.expect(!other_keypair.public_key.verify(signature, message));
+    const keypair = try Ed25519.generateKeyPair();
+    const message = "Hello, digital signatures!";
+
+    // Sign message
+    const signature = try keypair.private_key.sign(message);
+
+    // Verify signature
+    try testing.expect(keypair.public_key.verify(signature, message));
+
+    // Verification should fail with different message
+    try testing.expect(!keypair.public_key.verify(signature, "Different message"));
+
+    // Verification should fail with wrong public key
+    const other_keypair = try Ed25519.generateKeyPair();
+    try testing.expect(!other_keypair.public_key.verify(signature, message));
 }
 
 test "Key serialization - hex encoding" {
     const keypair = try X25519.generateKeyPair();
-    
+
     // Test public key hex encoding
     const public_hex = try keypair.public_key.hex(testing.allocator);
     defer testing.allocator.free(public_hex);
-    
+
     try testing.expect(public_hex.len == 64); // 32 bytes * 2 hex chars
-    
+
     // Test round-trip conversion
     const parsed_public = try X25519.PublicKey.fromHex(public_hex);
     try testing.expectEqualSlices(u8, keypair.public_key.slice(), parsed_public.slice());
@@ -698,35 +689,34 @@ test "Key serialization - hex encoding" {
 test "KeyManager - key exchange workflow" {
     var alice_keypair = try KeyManager.KeyExchangeKeyPair.generate(testing.allocator, .x25519);
     defer alice_keypair.deinit();
-    
+
     var bob_keypair = try KeyManager.KeyExchangeKeyPair.generate(testing.allocator, .x25519);
     defer bob_keypair.deinit();
-    
+
     // Perform key exchange
     const alice_shared = try alice_keypair.exchange(bob_keypair.public_key);
     defer testing.allocator.free(alice_shared);
-    
+
     const bob_shared = try bob_keypair.exchange(alice_keypair.public_key);
     defer testing.allocator.free(bob_shared);
-    
+
     // Should produce same shared secret
     try testing.expectEqualSlices(u8, alice_shared, bob_shared);
 }
 
 test "KeyManager - signature workflow" {
-    // TODO: Fix Ed25519 key generation first
-    // var keypair = try KeyManager.SignatureKeyPair.generate(testing.allocator, .ed25519);
-    // defer keypair.deinit();
-    // 
-    // const message = "Test message for signing";
-    // const signature_bytes = try keypair.sign(message);
-    // defer testing.allocator.free(signature_bytes);
-    // 
-    // // Verify using low-level API
-    // const public_key = try Ed25519.PublicKey.fromSlice(keypair.public_key);
-    // const signature = try Ed25519.SignatureValue.fromSlice(signature_bytes);
-    // 
-    // try testing.expect(public_key.verify(signature, message));
+    var keypair = try KeyManager.SignatureKeyPair.generate(testing.allocator, .ed25519);
+    defer keypair.deinit();
+
+    const message = "Test message for signing";
+    const signature_bytes = try keypair.sign(message);
+    defer testing.allocator.free(signature_bytes);
+
+    // Verify using low-level API
+    const public_key = try Ed25519.PublicKey.fromSlice(keypair.public_key);
+    const signature = try Ed25519.SignatureValue.fromSlice(signature_bytes);
+
+    try testing.expect(public_key.verify(signature, message));
 }
 
 test "Algorithm properties" {
@@ -734,7 +724,7 @@ test "Algorithm properties" {
     try testing.expect(KeyExchangeAlgorithm.x25519.privateKeyLength() == 32);
     try testing.expect(KeyExchangeAlgorithm.x25519.publicKeyLength() == 32);
     try testing.expect(KeyExchangeAlgorithm.x25519.sharedSecretLength() == 32);
-    
+
     // Signature algorithms
     try testing.expect(SignatureAlgorithm.ed25519.privateKeyLength() == 64);
     try testing.expect(SignatureAlgorithm.ed25519.publicKeyLength() == 32);
@@ -745,7 +735,7 @@ test "Error handling" {
     // Test invalid key lengths
     const short_key = [_]u8{0} ** 16;
     try testing.expectError(AsymmetricError.InvalidKeyLength, X25519.PrivateKey.fromSlice(&short_key));
-    
+
     // Test invalid hex parsing
     try testing.expectError(AsymmetricError.InvalidKeyLength, X25519.PublicKey.fromHex("invalid"));
     // Test invalid hex characters
