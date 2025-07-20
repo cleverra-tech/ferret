@@ -10,6 +10,8 @@ pub const allocator = @import("core/allocator.zig");
 pub const types = @import("core/types.zig");
 pub const atomic = @import("core/atomic.zig");
 pub const time = @import("core/time.zig");
+pub const config = @import("core/config.zig");
+pub const Config = @import("core/config.zig").Config;
 
 // Atomic types
 pub const AtomicCounter = @import("core/atomic.zig").AtomicCounter;

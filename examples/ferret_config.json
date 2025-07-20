@@ -1,0 +1,89 @@
+{
+  "server": {
+    "max_connections": 2000,
+    "default_port": 3000,
+    "worker_threads": 8,
+    "timeout_ms": 60000,
+    "enable_keep_alive": true,
+    "keep_alive_timeout": 120
+  },
+  "network": {
+    "listen_backlog": 256,
+    "default_http_port": 80,
+    "default_https_port": 443,
+    "default_test_port": 8080,
+    "tcp_nodelay": true,
+    "reuse_address": true,
+    "send_buffer_size": 131072,
+    "recv_buffer_size": 131072
+  },
+  "http": {
+    "max_header_size": 16384,
+    "max_headers_count": 200,
+    "max_body_size": 10485760,
+    "max_uri_length": 4096,
+    "enable_pipelining": false,
+    "strict_connection_header": true
+  },
+  "http2": {
+    "header_table_size": 8192,
+    "initial_window_size": 131072,
+    "max_frame_size": 32768,
+    "max_concurrent_streams": 200,
+    "enable_push": false,
+    "max_header_list_size": 16384
+  },
+  "http3": {
+    "qpack_max_table_capacity": 8192,
+    "max_field_section_size": 16384,
+    "qpack_blocked_streams": 0,
+    "enable_early_data": false,
+    "max_udp_payload_size": 1500,
+    "idle_timeout_ms": 60000
+  },
+  "buffer": {
+    "default_capacity": 8192,
+    "growth_factor": 1.5,
+    "max_size": 134217728,
+    "pool_size": 32,
+    "enable_pooling": true,
+    "alignment": 8
+  },
+  "reactor": {
+    "max_events": 2048,
+    "timeout_ms": 50,
+    "edge_triggered": true,
+    "oneshot": false,
+    "batch_size": 128
+  },
+  "collections": {
+    "hashmap_max_load_factor": 0.8,
+    "hashmap_initial_capacity": 32,
+    "array_default_capacity": 16,
+    "string_default_capacity": 64,
+    "queue_default_capacity": 32
+  },
+  "json": {
+    "max_parsing_depth": 256,
+    "max_string_length": 2097152,
+    "max_number_length": 128,
+    "allow_comments": false,
+    "allow_trailing_commas": false,
+    "strict_mode": true
+  },
+  "testing": {
+    "default_timeout_ms": 10000,
+    "benchmark_warmup_iterations": 2000,
+    "benchmark_iterations": 20000,
+    "enable_timing": true,
+    "enable_leak_detection": true,
+    "max_parallel_tests": 16
+  },
+  "crypto": {
+    "rng_seed": 0,
+    "default_hash_algorithm": "sha256",
+    "default_cipher_algorithm": "aes256_gcm",
+    "pbkdf2_iterations": 200000,
+    "salt_length": 64
+  }
+}

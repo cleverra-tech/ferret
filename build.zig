@@ -172,6 +172,24 @@ pub fn build(b: *std.Build) void {
     const http3_sendrequest_benchmark_step = b.step("benchmark-http3-sendrequest", "Run HTTP/3 sendRequest benchmark");
     http3_sendrequest_benchmark_step.dependOn(&run_http3_sendrequest_benchmark.step);
 
+    // Configuration demo
+    const config_demo = b.addExecutable(.{
+        .name = "config_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/config_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(config_demo);
+
+    const run_config_demo = b.addRunArtifact(config_demo);
+    const config_demo_step = b.step("demo-config", "Run configuration system demo");
+    config_demo_step.dependOn(&run_config_demo.step);
+
     // HTTP/2 demo
     const http2_demo = b.addExecutable(.{
         .name = "http2_demo",
@@ -334,6 +352,24 @@ pub fn build(b: *std.Build) void {
     const cli_benchmark_step = b.step("benchmark-cli", "Run CLI parsing performance benchmark");
     cli_benchmark_step.dependOn(&run_cli_benchmark.step);
 
+    // Configuration benchmark
+    const config_benchmark = b.addExecutable(.{
+        .name = "config_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/config_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(config_benchmark);
+
+    const run_config_benchmark = b.addRunArtifact(config_benchmark);
+    const config_benchmark_step = b.step("benchmark-config", "Run configuration system performance benchmark");
+    config_benchmark_step.dependOn(&run_config_benchmark.step);
+
     // HTTP client test
     const http_client_test = b.addExecutable(.{
         .name = "http_client_test",
@@ -380,4 +416,5 @@ pub fn build(b: *std.Build) void {
     benchmark_step.dependOn(&run_socket_benchmark.step);
     benchmark_step.dependOn(&run_atomic_benchmark.step);
     benchmark_step.dependOn(&run_cli_benchmark.step);
+    benchmark_step.dependOn(&run_config_benchmark.step);
 }
