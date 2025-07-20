@@ -306,13 +306,14 @@ pub const SocketManager = struct {
 
         // Set socket options
         const enable: c_int = 1;
-        _ = std.c.setsockopt(registration.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &enable, @sizeOf(c_int));
+        const enable_bytes = std.mem.asBytes(&enable);
+        _ = posix.setsockopt(registration.fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, enable_bytes) catch {};
 
         // Bind socket
         const sockaddr = address.getSockAddr();
         posix.bind(registration.fd, &sockaddr, @sizeOf(@TypeOf(sockaddr))) catch |err| switch (err) {
             error.AddressInUse => return SocketError.AddressInUse,
-            error.PermissionDenied => return SocketError.PermissionDenied,
+            error.AccessDenied => return SocketError.PermissionDenied,
             error.AddressNotAvailable => return SocketError.InvalidAddress,
             else => return SocketError.IOError,
         };
@@ -324,7 +325,10 @@ pub const SocketManager = struct {
         registration.protocol = protocol;
 
         // Register with reactor for accept events
-        try self.reactor.register(registration.fd, EventType{ .read = true }, Self.handleEvent, self);
+        self.reactor.register(registration.fd, EventType{ .read = true }, Self.handleEvent, self) catch |err| {
+            std.log.warn("Failed to register listener with reactor: {}", .{err});
+            return SocketError.IOError;
+        };
 
         return socket;
     }
@@ -339,7 +343,10 @@ pub const SocketManager = struct {
         registration.state = .connecting;
 
         // Register with reactor for connect completion
-        try self.reactor.register(registration.fd, EventType{ .write = true }, Self.handleEvent, self);
+        self.reactor.register(registration.fd, EventType{ .write = true }, Self.handleEvent, self) catch |err| {
+            std.log.warn("Failed to register client with reactor: {}", .{err});
+            return SocketError.IOError;
+        };
 
         // Attempt connection
         const sockaddr = address.getSockAddr();
@@ -374,6 +381,10 @@ pub const SocketManager = struct {
                 posix.close(accepted_fd);
                 return SocketError.OutOfMemory;
             },
+            error.BufferFull, error.NotEnoughData, error.InvalidRange => {
+                posix.close(accepted_fd);
+                return SocketError.IOError;
+            },
         };
 
         registration.state = .connected;
@@ -383,23 +394,26 @@ pub const SocketManager = struct {
         try self.fd_to_uuid.put(accepted_fd, uuid);
 
         // Register for read/write events
-        try self.reactor.register(accepted_fd, EventType{ .read = true, .write = true }, Self.handleEvent, self);
+        self.reactor.register(accepted_fd, EventType{ .read = true, .write = true }, Self.handleEvent, self) catch |err| {
+            std.log.warn("Failed to register socket with reactor: {}", .{err});
+            return SocketError.IOError;
+        };
 
         return Socket{ .uuid = uuid, .manager = self };
     }
 
     /// Handle reactor events
-    fn handleEvent(data: ?*anyopaque, event: Event) void {
-        const self: *Self = @ptrCast(@alignCast(data.?));
+    fn handleEvent(event: Event) void {
+        const self: *Self = @ptrCast(@alignCast(event.data.?));
         const uuid = self.fd_to_uuid.get(event.fd) orelse return;
         const registration = self.sockets.getPtr(uuid) orelse return;
 
-        if (event.event_type.err or event.event_type.hangup) {
+        if (event.events.err or event.events.hangup) {
             self.handleError(registration, SocketError.ConnectionClosed);
             return;
         }
 
-        if (event.event_type.read) {
+        if (event.events.read) {
             if (registration.state == .listening) {
                 self.handleAccept(registration);
             } else {
@@ -407,7 +421,7 @@ pub const SocketManager = struct {
             }
         }
 
-        if (event.event_type.write) {
+        if (event.events.write) {
             if (registration.state == .connecting) {
                 self.handleConnectComplete(registration);
             } else {
@@ -514,8 +528,8 @@ pub const SocketManager = struct {
     fn handleConnectComplete(self: *Self, registration: *SocketRegistration) void {
         // Check if connection succeeded
         var error_code: i32 = 0;
-        var len: posix.socklen_t = @sizeOf(i32);
-        _ = std.c.getsockopt(registration.fd, posix.SOL.SOCKET, posix.SO.ERROR, &error_code, &len);
+        const error_bytes = std.mem.asBytes(&error_code);
+        _ = posix.getsockopt(registration.fd, posix.SOL.SOCKET, posix.SO.ERROR, error_bytes) catch {};
 
         if (error_code != 0) {
             self.handleError(registration, SocketError.ConnectionFailed);

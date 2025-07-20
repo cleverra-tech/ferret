@@ -26,7 +26,9 @@ const Buffer = @import("../io/buffer.zig").Buffer;
 const SocketManager = @import("../io/socket.zig").SocketManager;
 const Socket = @import("../io/socket.zig").Socket;
 const SocketAddress = @import("../io/socket.zig").SocketAddress;
+const SocketError = @import("../io/socket.zig").SocketError;
 const Protocol = @import("../io/socket.zig").Protocol;
+const Reactor = @import("../io/reactor.zig").Reactor;
 
 /// HTTP client errors
 pub const HttpClientError = error{
@@ -44,6 +46,26 @@ pub const HttpClientError = error{
     ProtocolNegotiationFailed,
     /// Invalid response received
     InvalidResponse,
+    /// Memory allocation failed
+    OutOfMemory,
+    /// I/O operation failed
+    IOError,
+};
+
+/// HTTP server errors
+pub const HttpServerError = error{
+    /// Server is already listening
+    AlreadyListening,
+    /// Server is not listening
+    NotListening,
+    /// No request handler configured
+    NoRequestHandler,
+    /// Failed to bind to address
+    BindFailed,
+    /// Failed to start listening
+    ListenFailed,
+    /// Invalid address format
+    InvalidAddress,
     /// Memory allocation failed
     OutOfMemory,
     /// I/O operation failed
@@ -318,8 +340,8 @@ pub const Headers = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        var iterator = self.map.iterator();
-        while (iterator.next()) |entry| {
+        var map_iter = self.map.iterator();
+        while (map_iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.*);
         }
@@ -377,6 +399,10 @@ pub const Headers = struct {
 
     pub fn count(self: *const Self) u32 {
         return @intCast(self.map.count());
+    }
+
+    pub fn iter(self: *const Self) @TypeOf(self.map.iterator()) {
+        return self.map.iterator();
     }
 };
 
@@ -899,6 +925,12 @@ pub const Server = struct {
     address: net.Address,
     supported_versions: []const HttpVersion,
     default_version: HttpVersion,
+    socket_manager: ?*SocketManager,
+    listener_socket: ?Socket,
+    is_listening: bool,
+    request_handler: ?*const fn (request: *Request, response: *Response) anyerror!void,
+    max_connections: u32,
+    active_connections: u32,
 
     const Self = @This();
 
@@ -909,18 +941,345 @@ pub const Server = struct {
             .address = address,
             .supported_versions = supported,
             .default_version = .http_3_0,
+            .socket_manager = null,
+            .listener_socket = null,
+            .is_listening = false,
+            .request_handler = null,
+            .max_connections = 1000,
+            .active_connections = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        _ = self;
+        if (self.listener_socket) |socket| {
+            socket.close() catch {};
+        }
     }
 
-    pub fn listen(self: *Self) !void {
+    /// Set the request handler function
+    pub fn setRequestHandler(self: *Self, handler: *const fn (request: *Request, response: *Response) anyerror!void) void {
+        self.request_handler = handler;
+    }
+
+    /// Set maximum concurrent connections
+    pub fn setMaxConnections(self: *Self, max: u32) void {
+        self.max_connections = max;
+    }
+
+    /// Start listening for incoming connections
+    pub fn listen(self: *Self, socket_manager: *SocketManager) !void {
+        if (self.is_listening) {
+            return HttpServerError.AlreadyListening;
+        }
+
+        if (self.request_handler == null) {
+            return HttpServerError.NoRequestHandler;
+        }
+
+        self.socket_manager = socket_manager;
+
+        // Convert net.Address to SocketAddress
+        const socket_address = try self.netAddressToSocketAddress(self.address);
+
+        // Create protocol handler for accepting connections
+        const protocol = Protocol{
+            .onData = handleNewConnection,
+            .onError = handleListenerError,
+            .onClose = handleListenerClose,
+            .user_data = @ptrCast(self),
+        };
+
+        // Start listening on the socket
+        self.listener_socket = try socket_manager.listen(socket_address, protocol);
+        self.is_listening = true;
+
+        std.log.info("HTTP server listening on {any}", .{self.address});
+    }
+
+    /// Stop listening and close the server
+    pub fn stop(self: *Self) !void {
+        if (!self.is_listening) {
+            return;
+        }
+
+        if (self.listener_socket) |socket| {
+            try socket.close();
+        }
+
+        self.listener_socket = null;
+        self.is_listening = false;
+        self.socket_manager = null;
+
+        std.log.info("HTTP server stopped", .{});
+    }
+
+    /// Check if server is currently listening
+    pub fn isListening(self: *const Self) bool {
+        return self.is_listening;
+    }
+
+    /// Get current number of active connections
+    pub fn getActiveConnections(self: *const Self) u32 {
+        return self.active_connections;
+    }
+
+    /// Convert net.Address to SocketAddress
+    fn netAddressToSocketAddress(self: *const Self, address: net.Address) !SocketAddress {
         _ = self;
-        // Implementation would start listening on the address
-        // and handle incoming connections with protocol negotiation
-        return error.NotImplemented;
+        return switch (address.any.family) {
+            std.posix.AF.INET => SocketAddress{ .ipv4 = address },
+            std.posix.AF.INET6 => SocketAddress{ .ipv6 = address },
+            else => SocketError.InvalidAddress,
+        };
+    }
+
+    /// Handle new incoming connections
+    fn handleNewConnection(socket: Socket, data: []const u8) void {
+        _ = data; // Accept events don't have data
+
+        // Get server instance from socket user_data
+        const server = @as(*Server, @ptrCast(@alignCast(socket.manager.sockets.get(socket.uuid).?.protocol.user_data.?)));
+
+        if (server.active_connections >= server.max_connections) {
+            std.log.warn("Maximum connections reached, rejecting new connection", .{});
+            return;
+        }
+
+        // Accept the new connection
+        server.acceptConnection(socket) catch |err| {
+            std.log.err("Failed to accept connection: {}", .{err});
+        };
+    }
+
+    /// Accept and handle a new connection
+    fn acceptConnection(self: *Server, listener_socket: Socket) !void {
+        const socket_manager = self.socket_manager orelse return HttpServerError.NotListening;
+
+        // Create protocol for handling client data
+        const client_protocol = Protocol{
+            .onData = handleClientData,
+            .onClose = handleClientClose,
+            .onError = handleClientError,
+            .user_data = @ptrCast(self),
+        };
+
+        // Accept the incoming connection
+        if (try socket_manager.accept(listener_socket.uuid, client_protocol)) |client_socket| {
+            self.active_connections += 1;
+            std.log.debug("Accepted new connection, active: {}", .{self.active_connections});
+
+            // Connection will be handled by the reactor through the protocol callbacks
+            _ = client_socket;
+        }
+    }
+
+    /// Handle data from client connections
+    fn handleClientData(socket: Socket, data: []const u8) void {
+        const server = @as(*Server, @ptrCast(@alignCast(socket.manager.sockets.get(socket.uuid).?.protocol.user_data.?)));
+
+        server.processHttpRequest(socket, data) catch |err| {
+            std.log.err("Failed to process HTTP request: {}", .{err});
+            socket.close() catch {};
+        };
+    }
+
+    /// Process HTTP request from client
+    fn processHttpRequest(self: *Server, socket: Socket, data: []const u8) !void {
+        // Simple HTTP request parsing for demonstration
+        // In a production server, you'd want more robust parsing
+
+        // Parse the request line (GET /path HTTP/1.1)
+        const request_line_end = std.mem.indexOf(u8, data, "\r\n") orelse {
+            // Incomplete request, wait for more data
+            return;
+        };
+
+        const request_line = data[0..request_line_end];
+        var parts = std.mem.splitSequence(u8, request_line, " ");
+
+        const method_str = parts.next() orelse {
+            try self.sendErrorResponse(socket, .bad_request);
+            return;
+        };
+
+        const uri = parts.next() orelse {
+            try self.sendErrorResponse(socket, .bad_request);
+            return;
+        };
+
+        const version_str = parts.next() orelse {
+            try self.sendErrorResponse(socket, .bad_request);
+            return;
+        };
+
+        // Parse method
+        const http1_method = http1.Method.fromString(method_str) orelse {
+            try self.sendErrorResponse(socket, .method_not_allowed);
+            return;
+        };
+
+        // Convert to unified method
+        const method = switch (http1_method) {
+            .GET => Method.GET,
+            .POST => Method.POST,
+            .PUT => Method.PUT,
+            .DELETE => Method.DELETE,
+            .HEAD => Method.HEAD,
+            .OPTIONS => Method.OPTIONS,
+            .PATCH => Method.PATCH,
+            .TRACE => Method.TRACE,
+            .CONNECT => Method.CONNECT,
+        };
+
+        // Parse version
+        const version = http1.Version.fromString(version_str) orelse {
+            try self.sendErrorResponse(socket, .http_version_not_supported);
+            return;
+        };
+
+        // Check for end of headers
+        const headers_end = std.mem.indexOf(u8, data, "\r\n\r\n");
+        if (headers_end == null) {
+            // Incomplete request, wait for more data
+            return;
+        }
+
+        // Create request object
+        var request = Request.init(self.allocator, method, uri);
+        defer request.deinit();
+
+        // Set HTTP version
+        request.version = switch (version) {
+            .http_1_0 => .http_1_0,
+            .http_1_1 => .http_1_1,
+            .http_2_0 => .http_2_0,
+        };
+
+        // TODO: Parse headers properly (simplified for now)
+        try request.setHeader("Connection", "close"); // Default for now
+
+        // Create response object
+        var response = Response.init(self.allocator, .ok);
+        defer response.deinit();
+        response.version = request.version;
+
+        // Call the request handler
+        if (self.request_handler) |handler| {
+            handler(&request, &response) catch |err| {
+                std.log.err("Request handler failed: {}", .{err});
+                response.status = .internal_server_error;
+                response.setBody("Internal Server Error");
+            };
+        } else {
+            response.status = .not_implemented;
+            response.setBody("No request handler configured");
+        }
+
+        // Send response back to client
+        try self.sendHttpResponse(socket, &response);
+
+        // Close connection for now (could implement keep-alive later)
+        try socket.close();
+    }
+
+    /// Send error response to client
+    fn sendErrorResponse(self: *Server, socket: Socket, status: StatusCode) !void {
+        var response = Response.init(self.allocator, status);
+        defer response.deinit();
+
+        response.setBody(status.phrase());
+        try response.setHeader("Content-Type", "text/plain");
+        try response.setHeader("Connection", "close");
+
+        try self.sendHttpResponse(socket, &response);
+        try socket.close();
+    }
+
+    /// Send HTTP response to client
+    fn sendHttpResponse(self: *Server, socket: Socket, response: *const Response) !void {
+        var response_buffer = Buffer.init(self.allocator) catch return HttpServerError.OutOfMemory;
+        defer response_buffer.deinit();
+
+        // Build HTTP response
+        try self.buildHttpResponse(response, &response_buffer);
+
+        // Send response data
+        const response_data = response_buffer.readable();
+        try socket.write(response_data);
+    }
+
+    /// Build HTTP response in buffer
+    fn buildHttpResponse(self: *Server, response: *const Response, buffer: *Buffer) !void {
+        _ = self;
+
+        // Status line
+        const version_str = response.version.toString();
+        const status_code = @intFromEnum(response.status);
+        const status_phrase = response.status.phrase();
+
+        _ = try buffer.write(version_str);
+        _ = try buffer.write(" ");
+
+        // Write status code
+        var status_buf: [16]u8 = undefined;
+        const status_str = std.fmt.bufPrint(&status_buf, "{}", .{status_code}) catch return HttpServerError.OutOfMemory;
+        _ = try buffer.write(status_str);
+
+        _ = try buffer.write(" ");
+        _ = try buffer.write(status_phrase);
+        _ = try buffer.write("\r\n");
+
+        // Headers
+        var header_iter = response.headers.iter();
+        while (header_iter.next()) |entry| {
+            _ = try buffer.write(entry.key_ptr.*);
+            _ = try buffer.write(": ");
+            _ = try buffer.write(entry.value_ptr.*);
+            _ = try buffer.write("\r\n");
+        }
+
+        // Content-Length header if body is present
+        if (response.body) |body| {
+            var length_buf: [32]u8 = undefined;
+            const length_str = std.fmt.bufPrint(&length_buf, "{}", .{body.len}) catch return HttpServerError.OutOfMemory;
+            _ = try buffer.write("Content-Length: ");
+            _ = try buffer.write(length_str);
+            _ = try buffer.write("\r\n");
+        }
+
+        // End of headers
+        _ = try buffer.write("\r\n");
+
+        // Body
+        if (response.body) |body| {
+            _ = try buffer.write(body);
+        }
+    }
+
+    /// Handle client connection close
+    fn handleClientClose(socket: Socket) void {
+        const server = @as(*Server, @ptrCast(@alignCast(socket.manager.sockets.get(socket.uuid).?.protocol.user_data.?)));
+        server.active_connections = @max(server.active_connections - 1, 0);
+        std.log.debug("Client disconnected, active: {}", .{server.active_connections});
+    }
+
+    /// Handle client connection error
+    fn handleClientError(socket: Socket, err: SocketError) void {
+        const server = @as(*Server, @ptrCast(@alignCast(socket.manager.sockets.get(socket.uuid).?.protocol.user_data.?)));
+        server.active_connections = @max(server.active_connections - 1, 0);
+        std.log.warn("Client connection error: {}, active: {}", .{ err, server.active_connections });
+    }
+
+    /// Handle listener socket error
+    fn handleListenerError(socket: Socket, err: SocketError) void {
+        _ = socket;
+        std.log.err("Listener socket error: {}", .{err});
+    }
+
+    /// Handle listener socket close
+    fn handleListenerClose(socket: Socket) void {
+        _ = socket;
+        std.log.warn("Listener socket closed unexpectedly", .{});
     }
 
     pub fn setSupportedVersions(self: *Self, versions: []const HttpVersion) void {
@@ -1025,4 +1384,68 @@ test "HTTP client initialization" {
 
     client.setTimeout(10000);
     try testing.expect(client.timeout_ms == 10000);
+}
+
+test "HTTP server initialization" {
+    const address = try net.Address.parseIp4("127.0.0.1", 8080);
+    var server = Server.init(testing.allocator, address);
+    defer server.deinit();
+
+    try testing.expect(server.default_version == .http_3_0);
+    try testing.expect(server.max_connections == 1000);
+    try testing.expect(server.active_connections == 0);
+    try testing.expect(!server.isListening());
+
+    server.setMaxConnections(500);
+    try testing.expect(server.max_connections == 500);
+
+    server.setDefaultVersion(.http_1_1);
+    try testing.expect(server.default_version == .http_1_1);
+}
+
+test "HTTP server request handler" {
+    const address = try net.Address.parseIp4("127.0.0.1", 8080);
+    var server = Server.init(testing.allocator, address);
+    defer server.deinit();
+
+    // Test handler function
+    const TestHandler = struct {
+        fn handle(request: *Request, response: *Response) anyerror!void {
+            try testing.expect(request.method == .GET);
+            response.setBody("Hello, World!");
+            try response.setHeader("Content-Type", "text/plain");
+        }
+    };
+
+    server.setRequestHandler(TestHandler.handle);
+
+    // We can't easily test the actual server listening without a full integration test,
+    // but we can verify the handler is set
+    try testing.expect(server.request_handler != null);
+}
+
+test "HTTP server error handling" {
+    const address = try net.Address.parseIp4("127.0.0.1", 8080);
+    var server = Server.init(testing.allocator, address);
+    defer server.deinit();
+
+    // Test error cases without actually starting server
+    try testing.expect(!server.isListening());
+    try testing.expect(server.request_handler == null);
+
+    // Set a handler
+    const TestHandler = struct {
+        fn handle(request: *Request, response: *Response) anyerror!void {
+            _ = request;
+            response.setBody("OK");
+        }
+    };
+    server.setRequestHandler(TestHandler.handle);
+
+    // Verify handler is set
+    try testing.expect(server.request_handler != null);
+
+    // Test that server configuration works
+    try testing.expect(server.getActiveConnections() == 0);
+    try testing.expect(!server.isListening());
 }
