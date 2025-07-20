@@ -61,6 +61,29 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(json_benchmark);
 
     const run_json_benchmark = b.addRunArtifact(json_benchmark);
-    const benchmark_step = b.step("benchmark", "Run JSON benchmark");
+    const json_benchmark_step = b.step("benchmark-json", "Run JSON benchmark");
+    json_benchmark_step.dependOn(&run_json_benchmark.step);
+
+    // Reactor benchmark
+    const reactor_benchmark = b.addExecutable(.{
+        .name = "reactor_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/reactor_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(reactor_benchmark);
+
+    const run_reactor_benchmark = b.addRunArtifact(reactor_benchmark);
+    const reactor_benchmark_step = b.step("benchmark-reactor", "Run reactor benchmark");
+    reactor_benchmark_step.dependOn(&run_reactor_benchmark.step);
+
+    // Combined benchmark step
+    const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);
+    benchmark_step.dependOn(&run_reactor_benchmark.step);
 }

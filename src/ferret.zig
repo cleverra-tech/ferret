@@ -19,6 +19,8 @@ pub const Queue = @import("collections/queue.zig").Queue;
 
 // I/O and networking
 pub const Reactor = @import("io/reactor.zig").Reactor;
+pub const EventType = @import("io/reactor.zig").EventType;
+pub const Event = @import("io/reactor.zig").Event;
 pub const Socket = @import("io/socket.zig").Socket;
 pub const Buffer = @import("io/buffer.zig").Buffer;
 
