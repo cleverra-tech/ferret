@@ -154,6 +154,24 @@ pub fn build(b: *std.Build) void {
     const http3_demo_step = b.step("demo-http3", "Run HTTP/3 demo");
     http3_demo_step.dependOn(&run_http3_demo.step);
 
+    // HTTP/3 sendRequest benchmark
+    const http3_sendrequest_benchmark = b.addExecutable(.{
+        .name = "http3_sendrequest_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http3_sendrequest_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(http3_sendrequest_benchmark);
+
+    const run_http3_sendrequest_benchmark = b.addRunArtifact(http3_sendrequest_benchmark);
+    const http3_sendrequest_benchmark_step = b.step("benchmark-http3-sendrequest", "Run HTTP/3 sendRequest benchmark");
+    http3_sendrequest_benchmark_step.dependOn(&run_http3_sendrequest_benchmark.step);
+
     // HTTP/2 demo
     const http2_demo = b.addExecutable(.{
         .name = "http2_demo",

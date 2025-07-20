@@ -191,6 +191,75 @@ pub const Http3Frame = struct {
         try encodeVarint(writer, self.payload.len);
         try writer.writeAll(self.payload);
     }
+
+    /// Cleanup frame resources
+    pub fn deinit(self: *Self) void {
+        _ = self; // Frame payload is not owned, so nothing to cleanup
+    }
+};
+
+/// QPACK encoder for HTTP/3 header compression
+pub const QpackEncoder = struct {
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Self) void {
+        _ = self;
+    }
+
+    /// Encode header field
+    pub fn encodeHeader(self: *Self, buffer: *ArrayList(u8), name: []const u8, value: []const u8) !void {
+        _ = self;
+
+        // Check if header is in static table
+        const static_index = findInStaticTable(name, value);
+        if (static_index) |index| {
+            // Indexed field line
+            try encodeVarintWithPrefix(buffer.writer(), index, 7, 0x80);
+        } else {
+            // Literal field line with incremental indexing
+            try buffer.append(0x40); // 01 pattern
+            try encodeLiteralString(buffer, name);
+            try encodeLiteralString(buffer, value);
+        }
+    }
+
+    fn findInStaticTable(name: []const u8, value: []const u8) ?u64 {
+        for (QpackDecoder.QPACK_STATIC_TABLE, 0..) |entry, i| {
+            if (mem.eql(u8, entry.name, name) and mem.eql(u8, entry.value, value)) {
+                return i + 1; // QPACK uses 1-based indexing
+            }
+        }
+        return null;
+    }
+
+    fn encodeLiteralString(buffer: *ArrayList(u8), string: []const u8) !void {
+        try encodeVarint(buffer.writer(), string.len);
+        try buffer.appendSlice(string);
+    }
+};
+
+/// HTTP/3 response structure
+pub const Http3Response = struct {
+    status: u16,
+    headers: ArrayList(QpackDecoder.QpackEntry),
+    body: ArrayList(u8),
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self) void {
+        for (self.headers.items) |header| {
+            self.headers.allocator.free(header.name);
+            self.headers.allocator.free(header.value);
+        }
+        self.headers.deinit();
+        self.body.deinit();
+    }
 };
 
 /// QPACK decoder (simplified)
@@ -202,7 +271,7 @@ pub const QpackDecoder = struct {
 
     const Self = @This();
 
-    const QpackEntry = struct {
+    pub const QpackEntry = struct {
         name: []const u8,
         value: []const u8,
     };
@@ -356,8 +425,8 @@ pub const QuicConnection = struct {
         self.streams.deinit();
     }
 
-    /// Create new stream
-    pub fn createStream(self: *Self) !*QuicStream {
+    /// Create new stream with auto-generated ID
+    pub fn createNewStream(self: *Self) !*QuicStream {
         const stream_id = self.next_stream_id;
         self.next_stream_id += 4; // Increment by 4 to maintain proper stream ID spacing
 
@@ -368,14 +437,154 @@ pub const QuicConnection = struct {
     }
 
     /// Send HTTP/3 request
-    pub fn sendRequest(self: *Self, method: []const u8, path: []const u8, headers: []const QpackDecoder.QpackEntry, body: ?[]const u8) !void {
+    pub fn sendRequest(self: *Self, method: []const u8, path: []const u8, headers: []const QpackDecoder.QpackEntry, body: ?[]const u8) !u64 {
+        // Allocate a new bidirectional stream for the request
+        const stream_id = self.allocateStreamId();
+        var stream = try self.createStream(stream_id);
+        errdefer stream.deinit();
+
+        // Build HTTP/3 HEADERS frame with QPACK compression
+        const headers_frame = try self.buildHeadersFrame(method, path, headers);
+        defer self.allocator.free(headers_frame.payload);
+
+        // Send HEADERS frame
+        try stream.sendFrame(headers_frame);
+
+        // Send DATA frame if body is present
+        if (body) |request_body| {
+            const data_frame = Http3Frame{
+                .frame_type = .data,
+                .payload = try self.allocator.dupe(u8, request_body),
+            };
+            defer self.allocator.free(data_frame.payload);
+
+            try stream.sendFrame(data_frame);
+        }
+
+        // Register stream for response handling
+        try self.streams.put(stream_id, stream);
+
+        return stream_id;
+    }
+
+    /// Allocate a new client-initiated bidirectional stream ID
+    fn allocateStreamId(self: *Self) u64 {
+        const stream_id = self.next_stream_id;
+        self.next_stream_id += 4; // Client-initiated bidirectional streams increment by 4
+        return stream_id;
+    }
+
+    /// Create a new QUIC stream
+    fn createStream(self: *Self, stream_id: u64) !QuicStream {
+        return QuicStream.init(self.allocator, stream_id);
+    }
+
+    /// Build HTTP/3 HEADERS frame with QPACK compression
+    fn buildHeadersFrame(self: *Self, method: []const u8, path: []const u8, headers: []const QpackDecoder.QpackEntry) !Http3Frame {
+        var qpack_encoder = QpackEncoder.init(self.allocator);
+        defer qpack_encoder.deinit();
+
+        var header_block = ArrayList(u8).init(self.allocator);
+        defer header_block.deinit();
+
+        // Encode mandatory pseudo-headers
+        try qpack_encoder.encodeHeader(&header_block, ":method", method);
+        try qpack_encoder.encodeHeader(&header_block, ":path", path);
+        try qpack_encoder.encodeHeader(&header_block, ":scheme", "https");
+
+        // TODO: Extract authority from connection if available
+        // For now, use a default authority
+        try qpack_encoder.encodeHeader(&header_block, ":authority", "localhost");
+
+        // Encode additional headers
+        for (headers) |header| {
+            try qpack_encoder.encodeHeader(&header_block, header.name, header.value);
+        }
+
+        return Http3Frame{
+            .frame_type = .headers,
+            .payload = try self.allocator.dupe(u8, header_block.items),
+        };
+    }
+
+    /// Read HTTP/3 response from stream
+    pub fn readResponse(self: *Self, stream_id: u64) !Http3Response {
+        const stream = self.streams.get(stream_id) orelse return error.StreamNotFound;
+
+        var response = Http3Response{
+            .status = 0,
+            .headers = ArrayList(QpackDecoder.QpackEntry).init(self.allocator),
+            .body = ArrayList(u8).init(self.allocator),
+        };
+        errdefer response.deinit();
+
+        // Read frames from stream until complete response
+        while (true) {
+            const frame = try self.readFrameFromStream(stream) orelse break;
+            defer self.allocator.free(frame.payload);
+
+            switch (frame.frame_type) {
+                .headers => {
+                    try self.parseHeadersFrame(frame, &response);
+                },
+                .data => {
+                    try response.body.appendSlice(frame.payload);
+                },
+                else => {
+                    // Handle other frame types as needed
+                    continue;
+                },
+            }
+
+            // Check if response is complete
+            if (self.isResponseComplete(&response)) break;
+        }
+
+        return response;
+    }
+
+    /// Parse HEADERS frame and extract status and headers
+    fn parseHeadersFrame(self: *Self, frame: Http3Frame, response: *Http3Response) !void {
+        var qpack_decoder = QpackDecoder.init(self.allocator, 4096);
+        defer qpack_decoder.deinit();
+        var headers = ArrayList(QpackDecoder.QpackEntry).init(self.allocator);
+        defer {
+            for (headers.items) |header| {
+                self.allocator.free(header.name);
+                self.allocator.free(header.value);
+            }
+            headers.deinit();
+        }
+
+        try qpack_decoder.decode(frame.payload, &headers);
+
+        // Extract status from :status pseudo-header
+        for (headers.items) |header| {
+            if (std.mem.eql(u8, header.name, ":status")) {
+                response.status = std.fmt.parseInt(u16, header.value, 10) catch 500;
+            } else {
+                // Add to response headers (need to duplicate strings)
+                const name_copy = try self.allocator.dupe(u8, header.name);
+                const value_copy = try self.allocator.dupe(u8, header.value);
+                try response.headers.append(.{ .name = name_copy, .value = value_copy });
+            }
+        }
+    }
+
+    /// Read a frame from stream (simplified for demonstration)
+    fn readFrameFromStream(self: *Self, stream: *const QuicStream) !?Http3Frame {
         _ = self;
-        _ = method;
-        _ = path;
-        _ = headers;
-        _ = body;
-        // Implementation would encode headers using QPACK and send over QUIC stream
-        // This is a placeholder for the full implementation
+        // In a real implementation, this would read from the stream's receive buffer
+        // and parse HTTP/3 frames. For now, return null to indicate no more frames
+        _ = stream;
+        return null;
+    }
+
+    /// Check if HTTP/3 response is complete
+    fn isResponseComplete(self: *Self, response: *const Http3Response) bool {
+        _ = self;
+        // Simple heuristic: response is complete if we have a status
+        return response.status != 0;
     }
 };
 
@@ -517,6 +726,26 @@ pub fn decodeVarintWithPrefix(data: []const u8, pos: *usize, prefix_bits: u8) !u
     }
 
     return value;
+}
+
+pub fn encodeVarintWithPrefix(writer: anytype, value: u64, prefix_bits: u8, prefix_mask: u8) !void {
+    const max_prefix = (@as(u64, 1) << @intCast(prefix_bits)) - 1;
+
+    if (value < max_prefix) {
+        try writer.writeByte(@intCast(prefix_mask | value));
+        return;
+    }
+
+    // Write prefix with all bits set
+    try writer.writeByte(@intCast(prefix_mask | max_prefix));
+
+    // Encode remaining value
+    var remaining = value - max_prefix;
+    while (remaining >= 128) {
+        try writer.writeByte(@intCast((remaining % 128) | 128));
+        remaining /= 128;
+    }
+    try writer.writeByte(@intCast(remaining));
 }
 
 // Tests
