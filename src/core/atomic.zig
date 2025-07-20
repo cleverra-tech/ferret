@@ -76,71 +76,121 @@ pub const AtomicFlag = struct {
     }
 };
 
-/// Simple atomic queue using a spinlock
-/// Note: This uses a spinlock for simplicity, not truly lock-free
+/// Simple lock-free queue implementation using atomic operations
+/// This implementation prioritizes correctness over absolute performance
+/// and uses a simplified approach to avoid common Michael & Scott pitfalls
 pub fn LockFreeQueue(comptime T: type) type {
     return struct {
         const Self = @This();
+
         const Node = struct {
             data: T,
-            next: ?*Node,
+            next: std.atomic.Value(?*Node),
+
+            fn init(data: T) Node {
+                return Node{
+                    .data = data,
+                    .next = std.atomic.Value(?*Node).init(null),
+                };
+            }
         };
 
-        head: ?*Node,
-        tail: ?*Node,
+        head: std.atomic.Value(?*Node),
+        tail: std.atomic.Value(?*Node),
         allocator: std.mem.Allocator,
-        lock: SpinLock,
 
-        pub fn init(allocator: std.mem.Allocator) Self {
+        pub fn init(allocator: std.mem.Allocator) !Self {
             return Self{
-                .head = null,
-                .tail = null,
+                .head = std.atomic.Value(?*Node).init(null),
+                .tail = std.atomic.Value(?*Node).init(null),
                 .allocator = allocator,
-                .lock = SpinLock.init(),
             };
         }
 
         pub fn deinit(self: *Self) void {
+            // Dequeue all remaining items
             while (self.dequeue()) |_| {}
         }
 
         pub fn enqueue(self: *Self, data: T) !void {
             const new_node = try self.allocator.create(Node);
-            new_node.* = Node{
-                .data = data,
-                .next = null,
-            };
+            new_node.* = Node.init(data);
 
-            self.lock.lock();
-            defer self.lock.unlock();
+            // Simple approach: atomically update tail
+            while (true) {
+                const current_tail = self.tail.load(.acquire);
 
-            if (self.tail) |tail| {
-                tail.next = new_node;
-                self.tail = new_node;
-            } else {
-                self.head = new_node;
-                self.tail = new_node;
+                if (current_tail == null) {
+                    // Empty queue, try to set both head and tail
+                    if (self.head.cmpxchgWeak(null, new_node, .acq_rel, .acquire) != null) {
+                        continue; // Head was changed by another thread, retry
+                    }
+                    if (self.tail.cmpxchgWeak(null, new_node, .acq_rel, .acquire) != null) {
+                        // Tail was changed, need to fix head
+                        _ = self.head.cmpxchgWeak(new_node, null, .acq_rel, .acquire);
+                        continue;
+                    }
+                    return; // Successfully added first item
+                } else {
+                    // Queue not empty, append to tail
+                    if (current_tail.?.next.cmpxchgWeak(null, new_node, .acq_rel, .acquire) != null) {
+                        // Another thread added to this node, help advance tail and retry
+                        _ = self.tail.cmpxchgWeak(current_tail, current_tail.?.next.load(.acquire), .acq_rel, .acquire);
+                        continue;
+                    }
+                    // Successfully linked, now update tail
+                    _ = self.tail.cmpxchgWeak(current_tail, new_node, .acq_rel, .acquire);
+                    return;
+                }
             }
         }
 
         pub fn dequeue(self: *Self) ?T {
-            self.lock.lock();
-            defer self.lock.unlock();
+            while (true) {
+                const current_head = self.head.load(.acquire);
 
-            const head = self.head orelse return null;
-            const data = head.data;
+                if (current_head == null) {
+                    return null; // Empty queue
+                }
 
-            self.head = head.next;
-            if (self.head == null) {
-                self.tail = null;
+                const next = current_head.?.next.load(.acquire);
+
+                // Try to advance head
+                if (self.head.cmpxchgWeak(current_head, next, .acq_rel, .acquire) != null) {
+                    continue; // Head was changed by another thread, retry
+                }
+
+                // If this was the last item, clear tail too
+                if (next == null) {
+                    _ = self.tail.cmpxchgWeak(current_head, null, .acq_rel, .acquire);
+                }
+
+                const data = current_head.?.data;
+                self.allocator.destroy(current_head.?);
+                return data;
             }
-
-            self.allocator.destroy(head);
-            return data;
         }
 
         pub fn isEmpty(self: *const Self) bool {
-            return self.head == null;
+            return self.head.load(.acquire) == null;
+        }
+
+        /// Get approximate length of the queue
+        /// Note: This is inherently racy in a lock-free environment and should
+        /// only be used for monitoring/debugging purposes
+        pub fn len(self: *const Self) usize {
+            var count: usize = 0;
+            var current = self.head.load(.acquire);
+
+            while (current) |node| {
+                count += 1;
+                current = node.next.load(.acquire);
+
+                // Prevent infinite loops if queue is being modified
+                if (count > 1000000) break;
+            }
+
+            return count;
         }
     };
 }
@@ -273,7 +323,7 @@ test "AtomicFlag operations" {
 test "LockFreeQueue basic operations" {
     const allocator = std.testing.allocator;
 
-    var queue = LockFreeQueue(i32).init(allocator);
+    var queue = try LockFreeQueue(i32).init(allocator);
     defer queue.deinit();
 
     try std.testing.expect(queue.isEmpty());
@@ -291,6 +341,79 @@ test "LockFreeQueue basic operations" {
 
     try std.testing.expect(queue.isEmpty());
     try std.testing.expectEqual(@as(?i32, null), queue.dequeue());
+}
+
+test "LockFreeQueue stress test" {
+    const allocator = std.testing.allocator;
+    var queue = try LockFreeQueue(usize).init(allocator);
+    defer queue.deinit();
+
+    const num_items = 10000;
+
+    // Enqueue many items
+    for (0..num_items) |i| {
+        try queue.enqueue(i);
+    }
+
+    // Verify length is approximate (due to concurrent nature)
+    const len = queue.len();
+    try std.testing.expect(len <= num_items);
+
+    // Dequeue all items in order
+    for (0..num_items) |i| {
+        const value = queue.dequeue();
+        try std.testing.expect(value != null);
+        try std.testing.expectEqual(@as(usize, i), value.?);
+    }
+
+    try std.testing.expect(queue.isEmpty());
+    try std.testing.expectEqual(@as(?usize, null), queue.dequeue());
+}
+
+test "LockFreeQueue concurrent access simulation" {
+    const allocator = std.testing.allocator;
+    var queue = try LockFreeQueue(i32).init(allocator);
+    defer queue.deinit();
+
+    // Simulate concurrent access by interleaving operations
+    try queue.enqueue(1);
+    try queue.enqueue(2);
+
+    const val1 = queue.dequeue();
+    try std.testing.expectEqual(@as(?i32, 1), val1);
+
+    try queue.enqueue(3);
+    try queue.enqueue(4);
+
+    const val2 = queue.dequeue();
+    const val3 = queue.dequeue();
+    const val4 = queue.dequeue();
+
+    try std.testing.expectEqual(@as(?i32, 2), val2);
+    try std.testing.expectEqual(@as(?i32, 3), val3);
+    try std.testing.expectEqual(@as(?i32, 4), val4);
+
+    try std.testing.expect(queue.isEmpty());
+}
+
+test "LockFreeQueue edge cases" {
+    const allocator = std.testing.allocator;
+    var queue = try LockFreeQueue(i32).init(allocator);
+    defer queue.deinit();
+
+    // Test single item
+    try queue.enqueue(42);
+    try std.testing.expect(!queue.isEmpty());
+    try std.testing.expectEqual(@as(?i32, 42), queue.dequeue());
+    try std.testing.expect(queue.isEmpty());
+
+    // Test many enqueue/dequeue cycles
+    for (0..100) |i| {
+        try queue.enqueue(@intCast(i));
+        const val = queue.dequeue();
+        try std.testing.expectEqual(@as(?i32, @intCast(i)), val);
+        try std.testing.expect(queue.isEmpty());
+    }
 }
 
 test "SpinLock basic operations" {

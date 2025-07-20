@@ -11,6 +11,13 @@ pub const types = @import("core/types.zig");
 pub const atomic = @import("core/atomic.zig");
 pub const time = @import("core/time.zig");
 
+// Atomic types
+pub const AtomicCounter = @import("core/atomic.zig").AtomicCounter;
+pub const AtomicFlag = @import("core/atomic.zig").AtomicFlag;
+pub const LockFreeQueue = @import("core/atomic.zig").LockFreeQueue;
+pub const SpinLock = @import("core/atomic.zig").SpinLock;
+pub const RwLock = @import("core/atomic.zig").RwLock;
+
 // Collections
 pub const Array = @import("collections/array.zig").Array;
 pub const HashMap = @import("collections/hashmap.zig").HashMap;
@@ -25,9 +32,14 @@ pub const Reactor = @import("io/reactor.zig").Reactor;
 pub const EventType = @import("io/reactor.zig").EventType;
 pub const Event = @import("io/reactor.zig").Event;
 pub const Socket = @import("io/socket.zig").Socket;
+pub const SocketManager = @import("io/socket.zig").SocketManager;
+pub const SocketError = @import("io/socket.zig").SocketError;
+pub const SocketAddress = @import("io/socket.zig").SocketAddress;
+pub const Protocol = @import("io/socket.zig").Protocol;
 pub const Buffer = @import("io/buffer.zig").Buffer;
 pub const io = struct {
     pub const buffer = @import("io/buffer.zig");
+    pub const socket = @import("io/socket.zig");
 };
 
 // Protocols

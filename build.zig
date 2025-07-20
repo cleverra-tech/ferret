@@ -244,6 +244,42 @@ pub fn build(b: *std.Build) void {
     const buffer_benchmark_step = b.step("benchmark-buffer", "Run Buffer performance benchmark");
     buffer_benchmark_step.dependOn(&run_buffer_benchmark.step);
 
+    // Socket benchmark
+    const socket_benchmark = b.addExecutable(.{
+        .name = "socket_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/socket_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(socket_benchmark);
+
+    const run_socket_benchmark = b.addRunArtifact(socket_benchmark);
+    const socket_benchmark_step = b.step("benchmark-socket", "Run Socket performance benchmark");
+    socket_benchmark_step.dependOn(&run_socket_benchmark.step);
+
+    // Atomic benchmark
+    const atomic_benchmark = b.addExecutable(.{
+        .name = "atomic_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/atomic_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(atomic_benchmark);
+
+    const run_atomic_benchmark = b.addRunArtifact(atomic_benchmark);
+    const atomic_benchmark_step = b.step("benchmark-atomic", "Run Atomic operations performance benchmark");
+    atomic_benchmark_step.dependOn(&run_atomic_benchmark.step);
+
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);
@@ -251,4 +287,6 @@ pub fn build(b: *std.Build) void {
     benchmark_step.dependOn(&run_crypto_benchmark.step);
     benchmark_step.dependOn(&run_queue_benchmark.step);
     benchmark_step.dependOn(&run_buffer_benchmark.step);
+    benchmark_step.dependOn(&run_socket_benchmark.step);
+    benchmark_step.dependOn(&run_atomic_benchmark.step);
 }
