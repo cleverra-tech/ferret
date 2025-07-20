@@ -88,6 +88,27 @@ fn benchmarkKeyGeneration() !void {
         const ops_per_sec = (@as(f64, ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
         
         print("   Ed25519 key generation: {d:.2} ops/sec\n", .{ops_per_sec});
+        print("   Average time per key: {d:.2} μs\n", .{@as(f64, @floatFromInt(duration)) / (ITERATIONS * 1000.0)});
+    }
+
+    // ECDSA secp256k1 Key Generation
+    {
+        // Warmup
+        for (0..WARMUP_ITERATIONS) |_| {
+            _ = ferret.asymmetric.EcdsaSecp256k1.generateKeyPair() catch unreachable;
+        }
+        
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        for (0..ITERATIONS) |_| {
+            _ = ferret.asymmetric.EcdsaSecp256k1.generateKeyPair() catch unreachable;
+        }
+        const end_time = std.time.nanoTimestamp();
+        
+        const duration = end_time - start_time;
+        const ops_per_sec = (@as(f64, ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
+        
+        print("   ECDSA secp256k1 key generation: {d:.2} ops/sec\n", .{ops_per_sec});
         print("   Average time per key: {d:.2} μs\n\n", .{@as(f64, @floatFromInt(duration)) / (ITERATIONS * 1000.0)});
     }
 }
@@ -167,7 +188,56 @@ fn benchmarkDigitalSignatures() !void {
         const ops_per_sec = (@as(f64, SIGNATURE_ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
         
         print("   Ed25519 verification: {d:.2} ops/sec\n", .{ops_per_sec});
-        print("   Average time per verification: {d:.2} μs\n\n", .{@as(f64, @floatFromInt(duration)) / (SIGNATURE_ITERATIONS * 1000.0)});
+        print("   Average time per verification: {d:.2} μs\n", .{@as(f64, @floatFromInt(duration)) / (SIGNATURE_ITERATIONS * 1000.0)});
+    }
+
+    // ECDSA secp256k1 Performance
+    {
+        const secp256k1_keypair = try ferret.asymmetric.EcdsaSecp256k1.generateKeyPair();
+        
+        // Signing Performance
+        {
+            // Warmup
+            for (0..WARMUP_ITERATIONS) |_| {
+                _ = secp256k1_keypair.private_key.sign(message) catch unreachable;
+            }
+            
+            // Benchmark
+            const start_time = std.time.nanoTimestamp();
+            for (0..SIGNATURE_ITERATIONS) |_| {
+                _ = secp256k1_keypair.private_key.sign(message) catch unreachable;
+            }
+            const end_time = std.time.nanoTimestamp();
+            
+            const duration = end_time - start_time;
+            const ops_per_sec = (@as(f64, SIGNATURE_ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
+            
+            print("   ECDSA secp256k1 signing: {d:.2} ops/sec\n", .{ops_per_sec});
+            print("   Average time per signature: {d:.2} μs\n", .{@as(f64, @floatFromInt(duration)) / (SIGNATURE_ITERATIONS * 1000.0)});
+        }
+
+        // Verification Performance
+        {
+            const secp256k1_signature = try secp256k1_keypair.private_key.sign(message);
+            
+            // Warmup
+            for (0..WARMUP_ITERATIONS) |_| {
+                _ = secp256k1_keypair.public_key.verify(secp256k1_signature, message);
+            }
+            
+            // Benchmark
+            const start_time = std.time.nanoTimestamp();
+            for (0..SIGNATURE_ITERATIONS) |_| {
+                _ = secp256k1_keypair.public_key.verify(secp256k1_signature, message);
+            }
+            const end_time = std.time.nanoTimestamp();
+            
+            const duration = end_time - start_time;
+            const ops_per_sec = (@as(f64, SIGNATURE_ITERATIONS) * 1_000_000_000.0) / @as(f64, @floatFromInt(duration));
+            
+            print("   ECDSA secp256k1 verification: {d:.2} ops/sec\n", .{ops_per_sec});
+            print("   Average time per verification: {d:.2} μs\n\n", .{@as(f64, @floatFromInt(duration)) / (SIGNATURE_ITERATIONS * 1000.0)});
+        }
     }
 }
 

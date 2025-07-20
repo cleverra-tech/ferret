@@ -288,9 +288,9 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                         return Self{ .bytes = keypair.secret_key.bytes };
                     },
                     .ecdsa_secp256k1 => {
-                        var key: Self = undefined;
-                        crypto.random.bytes(&key.bytes);
-                        return key;
+                        // Use Zig's built-in ECDSA secp256k1 key generation
+                        const keypair = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.KeyPair.generate();
+                        return Self{ .bytes = keypair.secret_key.bytes };
                     },
                 }
             }
@@ -328,8 +328,13 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                         return PublicKey.fromBytes(keypair.public_key.bytes);
                     },
                     .ecdsa_secp256k1 => {
-                        // TODO: Implement ECDSA secp256k1 when available in std.crypto
-                        return AsymmetricError.KeyGenerationFailed;
+                        const secret_key = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.SecretKey.fromBytes(self.bytes) catch {
+                            return AsymmetricError.InvalidPrivateKey;
+                        };
+                        const keypair = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.KeyPair.fromSecretKey(secret_key) catch {
+                            return AsymmetricError.KeyGenerationFailed;
+                        };
+                        return PublicKey.fromBytes(keypair.public_key.toCompressedSec1());
                     },
                 }
             }
@@ -350,8 +355,16 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                         return SignatureValue.fromBytes(signature.toBytes());
                     },
                     .ecdsa_secp256k1 => {
-                        // TODO: Implement ECDSA secp256k1 when available in std.crypto
-                        return AsymmetricError.SignatureFailed;
+                        const secret_key = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.SecretKey.fromBytes(self.bytes) catch {
+                            return AsymmetricError.InvalidPrivateKey;
+                        };
+                        const keypair = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.KeyPair.fromSecretKey(secret_key) catch {
+                            return AsymmetricError.SignatureFailed;
+                        };
+                        const signature = keypair.sign(message, null) catch {
+                            return AsymmetricError.SignatureFailed;
+                        };
+                        return SignatureValue.fromBytes(signature.toBytes());
                     },
                 }
             }
@@ -402,8 +415,14 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                         return true;
                     },
                     .ecdsa_secp256k1 => {
-                        // TODO: Implement ECDSA secp256k1 when available in std.crypto
-                        return false;
+                        const public_key = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.PublicKey.fromSec1(&self.bytes) catch {
+                            return false;
+                        };
+                        const sig = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.Signature.fromBytes(signature.bytes);
+                        sig.verify(message, public_key) catch {
+                            return false;
+                        };
+                        return true;
                     },
                 }
             }
@@ -493,8 +512,10 @@ pub fn Signature(comptime algorithm: SignatureAlgorithm) type {
                     return .{ .private_key = private_key, .public_key = public_key };
                 },
                 .ecdsa_secp256k1 => {
-                    const private_key = PrivateKey.generate();
-                    const public_key = try private_key.publicKey();
+                    // Use Zig's built-in ECDSA secp256k1 key pair generation
+                    const keypair = crypto.sign.ecdsa.EcdsaSecp256k1Sha256.KeyPair.generate();
+                    const private_key = PrivateKey.fromBytes(keypair.secret_key.bytes);
+                    const public_key = PublicKey.fromBytes(keypair.public_key.toCompressedSec1());
                     return .{ .private_key = private_key, .public_key = public_key };
                 },
             }
@@ -587,7 +608,16 @@ pub const KeyManager = struct {
                     };
                 },
                 .ecdsa_secp256k1 => {
-                    return AsymmetricError.KeyGenerationFailed;
+                    const keypair = try EcdsaSecp256k1.generateKeyPair();
+                    const private_key = try allocator.dupe(u8, keypair.private_key.slice());
+                    const public_key = try allocator.dupe(u8, keypair.public_key.slice());
+
+                    return Self{
+                        .algorithm = algorithm,
+                        .private_key = private_key,
+                        .public_key = public_key,
+                        .allocator = allocator,
+                    };
                 },
             }
         }
@@ -602,7 +632,10 @@ pub const KeyManager = struct {
                     return self.allocator.dupe(u8, signature.slice());
                 },
                 .ecdsa_secp256k1 => {
-                    return AsymmetricError.SignatureFailed;
+                    const private = try EcdsaSecp256k1.PrivateKey.fromSlice(self.private_key);
+                    const signature = try private.sign(message);
+
+                    return self.allocator.dupe(u8, signature.slice());
                 },
             }
         }
@@ -669,6 +702,24 @@ test "Ed25519 - signing and verification" {
 
     // Verification should fail with wrong public key
     const other_keypair = try Ed25519.generateKeyPair();
+    try testing.expect(!other_keypair.public_key.verify(signature, message));
+}
+
+test "ECDSA secp256k1 - signing and verification" {
+    const keypair = try EcdsaSecp256k1.generateKeyPair();
+    const message = "Hello, ECDSA secp256k1!";
+
+    // Sign message
+    const signature = try keypair.private_key.sign(message);
+
+    // Verify signature
+    try testing.expect(keypair.public_key.verify(signature, message));
+
+    // Verification should fail with different message
+    try testing.expect(!keypair.public_key.verify(signature, "Different message"));
+
+    // Verification should fail with wrong public key
+    const other_keypair = try EcdsaSecp256k1.generateKeyPair();
     try testing.expect(!other_keypair.public_key.verify(signature, message));
 }
 
