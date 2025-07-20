@@ -46,6 +46,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
 
+    // Integration tests
+    const integration_tests = b.addExecutable(.{
+        .name = "integration_tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/integration_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(integration_tests);
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    const integration_test_step = b.step("test-integration", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_tests.step);
+
     // JSON benchmark
     const json_benchmark = b.addExecutable(.{
         .name = "json_benchmark",
