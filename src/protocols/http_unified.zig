@@ -819,20 +819,82 @@ pub const Client = struct {
     }
 
     fn readHttpResponse(self: *Self, socket: Socket, timeout_ms: u32) ![]u8 {
-        _ = timeout_ms; // TODO: Implement timeout handling
         var response_buffer = try Buffer.init(self.allocator);
         defer response_buffer.deinit();
 
-        // TODO: Read from socket with proper error handling and timeout
-        // This is a placeholder implementation - in production would:
-        // 1. Use reactor for non-blocking I/O
-        // 2. Implement proper timeout handling
-        // 3. Handle partial reads and connection errors
-        _ = socket;
+        // Implement proper socket reading with timeout handling
+        var response_data = std.ArrayList(u8).init(self.allocator);
+        defer response_data.deinit();
 
-        // For now, return a placeholder response for testing
-        const placeholder_response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
-        return try self.allocator.dupe(u8, placeholder_response);
+        var buffer: [4096]u8 = undefined;
+        var total_read: usize = 0;
+        var headers_complete = false;
+        var content_length: ?usize = null;
+        var headers_end_pos: usize = 0;
+
+        // Read response with timeout
+        const start_time = std.time.milliTimestamp();
+        const timeout_deadline = start_time + @as(i64, @intCast(timeout_ms));
+
+        while (std.time.milliTimestamp() < timeout_deadline) {
+            const bytes_read = socket.read(&buffer) catch |err| switch (err) {
+                error.WouldBlock => {
+                    std.time.sleep(1_000_000); // Sleep 1ms
+                    continue;
+                },
+                else => return err,
+            };
+
+            if (bytes_read == 0) break; // Connection closed
+
+            try response_data.appendSlice(buffer[0..bytes_read]);
+            total_read += bytes_read;
+
+            // Check if headers are complete
+            if (!headers_complete) {
+                if (std.mem.indexOf(u8, response_data.items, "\r\n\r\n")) |pos| {
+                    headers_complete = true;
+                    headers_end_pos = pos + 4;
+
+                    // Parse Content-Length if present
+                    const headers_only = response_data.items[0..pos];
+                    if (std.mem.indexOf(u8, headers_only, "Content-Length:")) |cl_pos| {
+                        const line_start = cl_pos;
+                        const line_end = std.mem.indexOf(u8, headers_only[line_start..], "\r\n") orelse headers_only.len - line_start;
+                        const cl_line = headers_only[line_start .. line_start + line_end];
+
+                        if (std.mem.indexOf(u8, cl_line, ":")) |colon_pos| {
+                            const value_start = colon_pos + 1;
+                            while (value_start < cl_line.len and cl_line[value_start] == ' ') {
+                                // Skip spaces
+                            }
+                            const cl_str = std.mem.trim(u8, cl_line[colon_pos + 1 ..], " \t");
+                            content_length = std.fmt.parseInt(usize, cl_str, 10) catch null;
+                        }
+                    }
+                }
+            }
+
+            // Check if we have complete response
+            if (headers_complete) {
+                if (content_length) |cl| {
+                    const body_bytes = total_read - headers_end_pos;
+                    if (body_bytes >= cl) {
+                        break; // Complete response received
+                    }
+                } else {
+                    // No Content-Length, assume response is complete for now
+                    // In real implementation, would handle chunked encoding
+                    break;
+                }
+            }
+        }
+
+        if (total_read == 0) {
+            return error.Timeout;
+        }
+
+        return try self.allocator.dupe(u8, response_data.items);
     }
 
     fn parseHttp1Response(self: *Self, response_data: []const u8) !Response {

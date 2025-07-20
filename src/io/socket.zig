@@ -95,7 +95,18 @@ pub const SocketAddress = union(enum) {
         return switch (self) {
             .ipv4 => |addr| addr.any,
             .ipv6 => |addr| addr.any,
-            .unix => unreachable, // TODO: Implement Unix domain socket support
+            .unix => |path| blk: {
+                // Create a sockaddr_un structure for Unix domain sockets
+                var addr: std.posix.sockaddr.un = std.mem.zeroes(std.posix.sockaddr.un);
+                addr.family = std.posix.AF.UNIX;
+
+                // Copy path to sun_path, ensuring null termination
+                const max_path_len = @min(path.len, addr.path.len - 1);
+                @memcpy(addr.path[0..max_path_len], path[0..max_path_len]);
+                addr.path[max_path_len] = 0;
+
+                break :blk @as(std.posix.sockaddr, @bitCast(addr));
+            },
         };
     }
 

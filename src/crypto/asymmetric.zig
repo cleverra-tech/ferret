@@ -217,42 +217,47 @@ pub fn KeyExchange(comptime algorithm: KeyExchangeAlgorithm) type {
                 return &self.bytes;
             }
 
-            /// Derive symmetric key from shared secret using HKDF
+            /// Derive symmetric key from shared secret using HKDF (RFC 5869)
             pub fn deriveKey(self: *const Self, allocator: Allocator, info: []const u8, length: usize) ![]u8 {
-                // TODO: Implement proper HKDF when available in std.crypto
-                // For now, use HMAC-based key derivation
                 const hash = @import("hash.zig");
+                const hash_len = 32; // SHA-256 output length
 
-                // Use shared secret as HMAC key, info as data
-                const hmac_result = hash.MacAuth.hmacSha256(self.slice(), info);
+                // HKDF-Extract: PRK = HMAC-Hash(salt, IKM)
+                // Use zero salt for simplicity
+                const salt = [_]u8{0} ** hash_len;
+                const prk = hash.MacAuth.hmacSha256(&salt, self.slice());
 
-                if (length <= 32) {
-                    const result = try allocator.alloc(u8, length);
-                    @memcpy(result, hmac_result.slice()[0..length]);
-                    return result;
-                } else {
-                    // For longer keys, concatenate multiple HMAC rounds
-                    const result = try allocator.alloc(u8, length);
-                    var offset: usize = 0;
-                    var counter: u8 = 1;
+                // HKDF-Expand: OKM = HKDF-Expand(PRK, info, L)
+                const n = (length + hash_len - 1) / hash_len; // ceil(L / HashLen)
+                if (n > 255) return error.InvalidLength;
 
-                    while (offset < length) {
-                        var hmac_input = std.ArrayList(u8).init(allocator);
-                        defer hmac_input.deinit();
+                var okm = try allocator.alloc(u8, length);
+                var t_prev: [hash_len]u8 = undefined;
+                var offset: usize = 0;
 
-                        try hmac_input.appendSlice(info);
-                        try hmac_input.append(counter);
+                for (1..n + 1) |i| {
+                    var hmac_input = std.ArrayList(u8).init(allocator);
+                    defer hmac_input.deinit();
 
-                        const hmac_result_round = hash.MacAuth.hmacSha256(self.slice(), hmac_input.items);
-                        const copy_len = @min(32, length - offset);
-                        @memcpy(result[offset .. offset + copy_len], hmac_result_round.slice()[0..copy_len]);
-
-                        offset += copy_len;
-                        counter += 1;
+                    // T(i) = HMAC-Hash(PRK, T(i-1) | info | i)
+                    if (i > 1) {
+                        try hmac_input.appendSlice(&t_prev);
                     }
+                    try hmac_input.appendSlice(info);
+                    try hmac_input.append(@intCast(i));
 
-                    return result;
+                    const t_current = hash.MacAuth.hmacSha256(prk.slice(), hmac_input.items);
+
+                    // Copy to output
+                    const copy_len = @min(hash_len, length - offset);
+                    @memcpy(okm[offset .. offset + copy_len], t_current.slice()[0..copy_len]);
+
+                    // Save for next iteration
+                    @memcpy(&t_prev, t_current.slice());
+                    offset += copy_len;
                 }
+
+                return okm;
             }
 
             /// Securely clear shared secret from memory

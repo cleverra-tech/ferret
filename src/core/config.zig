@@ -29,6 +29,15 @@ pub const ServerConfig = struct {
     /// Request timeout in milliseconds
     timeout_ms: u32 = 30000,
 
+    /// Default buffer size for I/O operations
+    buffer_size: u32 = 4096,
+
+    /// Maximum body size for HTTP requests
+    max_body_size: usize = 1024 * 1024, // 1MB
+
+    /// Default authority for HTTP/3 requests
+    default_authority: []const u8 = "localhost",
+
     /// Enable keep-alive connections
     enable_keep_alive: bool = true,
 

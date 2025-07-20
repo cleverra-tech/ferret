@@ -789,24 +789,72 @@ pub const UpgradeHandler = struct {
         return response.toOwnedSlice();
     }
 
-    // TODO: Implement proper subprotocol and extension negotiation
+    /// Supported WebSocket subprotocols (can be configured)
+    const SUPPORTED_SUBPROTOCOLS = [_][]const u8{
+        "chat",
+        "echo",
+        "json",
+        "binary",
+    };
+
+    /// Supported WebSocket extensions
+    const SUPPORTED_EXTENSIONS = [_][]const u8{
+        "permessage-deflate",
+    };
+
     fn selectSubprotocol(allocator: Allocator, requested: []const u8) ![]const u8 {
-        // For now, just return the first requested subprotocol
         _ = allocator;
 
+        // Parse requested subprotocols
         var iter = std.mem.splitSequence(u8, requested, ",");
-        if (iter.next()) |first| {
-            return std.mem.trim(u8, first, " \t");
+        while (iter.next()) |protocol| {
+            const trimmed = std.mem.trim(u8, protocol, " \t");
+
+            // Check if we support this subprotocol
+            for (SUPPORTED_SUBPROTOCOLS) |supported| {
+                if (std.mem.eql(u8, trimmed, supported)) {
+                    return supported;
+                }
+            }
         }
 
-        return "";
+        return ""; // No supported subprotocol found
     }
 
     fn selectExtensions(allocator: Allocator, requested: []const u8) ![]const u8 {
-        // For now, don't support any extensions
-        _ = allocator;
-        _ = requested;
-        return "";
+        var selected = std.ArrayList(u8).init(allocator);
+        defer selected.deinit();
+
+        // Parse requested extensions
+        var iter = std.mem.splitSequence(u8, requested, ",");
+        while (iter.next()) |extension| {
+            const trimmed = std.mem.trim(u8, extension, " \t");
+
+            // Parse extension name and parameters
+            var ext_iter = std.mem.splitSequence(u8, trimmed, ";");
+            if (ext_iter.next()) |ext_name| {
+                const ext_name_trimmed = std.mem.trim(u8, ext_name, " \t");
+
+                // Check if we support this extension
+                for (SUPPORTED_EXTENSIONS) |supported| {
+                    if (std.mem.eql(u8, ext_name_trimmed, supported)) {
+                        if (selected.items.len > 0) {
+                            try selected.appendSlice(", ");
+                        }
+
+                        if (std.mem.eql(u8, supported, "permessage-deflate")) {
+                            // Add permessage-deflate with default parameters
+                            try selected.appendSlice("permessage-deflate; server_max_window_bits=15");
+                        } else {
+                            try selected.appendSlice(supported);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        return selected.toOwnedSlice();
     }
 };
 

@@ -30,7 +30,7 @@ pub const BufferError = error{
 /// Provides efficient read/write operations with automatic growth
 pub const Buffer = struct {
     const Self = @This();
-    const DEFAULT_CAPACITY = 4096;
+    const DEFAULT_CAPACITY = 4096; // Use default value, can be overridden at runtime
     const GROWTH_FACTOR = 2;
 
     data: []u8,
