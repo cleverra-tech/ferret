@@ -26,6 +26,9 @@ pub const EventType = @import("io/reactor.zig").EventType;
 pub const Event = @import("io/reactor.zig").Event;
 pub const Socket = @import("io/socket.zig").Socket;
 pub const Buffer = @import("io/buffer.zig").Buffer;
+pub const io = struct {
+    pub const buffer = @import("io/buffer.zig");
+};
 
 // Protocols
 pub const Http = @import("protocols/http_unified.zig"); // Unified HTTP API (defaults to HTTP/3)

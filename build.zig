@@ -226,10 +226,29 @@ pub fn build(b: *std.Build) void {
     const queue_benchmark_step = b.step("benchmark-queue", "Run Queue performance benchmark");
     queue_benchmark_step.dependOn(&run_queue_benchmark.step);
 
+    // Buffer benchmark
+    const buffer_benchmark = b.addExecutable(.{
+        .name = "buffer_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/buffer_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(buffer_benchmark);
+
+    const run_buffer_benchmark = b.addRunArtifact(buffer_benchmark);
+    const buffer_benchmark_step = b.step("benchmark-buffer", "Run Buffer performance benchmark");
+    buffer_benchmark_step.dependOn(&run_buffer_benchmark.step);
+
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);
     benchmark_step.dependOn(&run_reactor_benchmark.step);
     benchmark_step.dependOn(&run_crypto_benchmark.step);
     benchmark_step.dependOn(&run_queue_benchmark.step);
+    benchmark_step.dependOn(&run_buffer_benchmark.step);
 }
