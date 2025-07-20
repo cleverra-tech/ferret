@@ -82,8 +82,27 @@ pub fn build(b: *std.Build) void {
     const reactor_benchmark_step = b.step("benchmark-reactor", "Run reactor benchmark");
     reactor_benchmark_step.dependOn(&run_reactor_benchmark.step);
 
+    // Crypto benchmark
+    const crypto_benchmark = b.addExecutable(.{
+        .name = "crypto_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/crypto_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(crypto_benchmark);
+
+    const run_crypto_benchmark = b.addRunArtifact(crypto_benchmark);
+    const crypto_benchmark_step = b.step("benchmark-crypto", "Run crypto benchmark");
+    crypto_benchmark_step.dependOn(&run_crypto_benchmark.step);
+
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
     benchmark_step.dependOn(&run_json_benchmark.step);
     benchmark_step.dependOn(&run_reactor_benchmark.step);
+    benchmark_step.dependOn(&run_crypto_benchmark.step);
 }
