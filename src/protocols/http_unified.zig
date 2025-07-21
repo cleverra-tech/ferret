@@ -24,6 +24,7 @@ const http2 = @import("http2.zig");
 const http3 = @import("http3.zig");
 const Buffer = @import("../io/buffer.zig").Buffer;
 const SocketManager = @import("../io/socket.zig").SocketManager;
+const SocketUUID = @import("../io/socket.zig").SocketUUID;
 const Socket = @import("../io/socket.zig").Socket;
 const SocketAddress = @import("../io/socket.zig").SocketAddress;
 const SocketError = @import("../io/socket.zig").SocketError;
@@ -1008,6 +1009,8 @@ pub const Client = struct {
         next_stream_id: u31,
         connection_window: i32,
         streams: std.HashMap(u31, Http2StreamState, std.hash_map.AutoContext(u31), std.hash_map.default_max_load_percentage),
+        local_settings: http2.Settings,
+        peer_settings: http2.Settings,
 
         const Http2StreamState = struct {
             window_size: i32,
@@ -1015,6 +1018,7 @@ pub const Client = struct {
             end_stream_received: bool,
             response_headers: ArrayList(http2.HeaderEntry),
             response_data: ArrayList(u8),
+            reset_error_code: ?http2.ErrorCode,
         };
 
         fn init(allocator: Allocator, socket_manager: *SocketManager, socket: Socket) Http2Connection {
@@ -1027,6 +1031,8 @@ pub const Client = struct {
                 .next_stream_id = 1, // Client uses odd stream IDs
                 .connection_window = 65535,
                 .streams = std.HashMap(u31, Http2StreamState, std.hash_map.AutoContext(u31), std.hash_map.default_max_load_percentage).init(allocator),
+                .local_settings = http2.Settings.getDefaultSettings(),
+                .peer_settings = http2.Settings.getDefaultSettings(),
             };
         }
 
@@ -1098,6 +1104,7 @@ pub const Client = struct {
                 .end_stream_received = false,
                 .response_headers = ArrayList(http2.HeaderEntry).init(self.allocator),
                 .response_data = ArrayList(u8).init(self.allocator),
+                .reset_error_code = null,
             };
             try self.streams.put(stream_id, stream_state);
 
@@ -1288,7 +1295,7 @@ pub const Client = struct {
             }
 
             // Process settings and send ACK
-            _ = payload; // TODO: Parse and apply settings
+            try self.parseAndApplySettings(payload);
 
             const ack_frame = http2.Frame.settings(&[_]u8{}, true);
             var frame_buffer = std.ArrayList(u8).init(self.allocator);
@@ -1296,6 +1303,135 @@ pub const Client = struct {
             const frame_writer = frame_buffer.writer();
             try ack_frame.serialize(frame_writer);
             try self.socket_manager.writeSocket(self.socket.uuid, frame_buffer.items, null);
+        }
+
+        fn parseAndApplySettings(self: *Http2Connection, payload: []const u8) !void {
+            // RFC 7540: SETTINGS frame payload must be a multiple of 6 bytes
+            if (payload.len % 6 != 0) {
+                std.log.err("Invalid SETTINGS frame: payload length {} is not multiple of 6", .{payload.len});
+                return error.InvalidSettingsFrame;
+            }
+
+            // Store previous settings for rollback if needed
+            const previous_settings = self.peer_settings;
+            var changes_applied: u32 = 0;
+
+            var offset: usize = 0;
+            while (offset < payload.len) {
+                const setting_id = mem.readInt(u16, payload[offset .. offset + 2][0..2], .big);
+                const setting_value = mem.readInt(u32, payload[offset + 2 .. offset + 6][0..4], .big);
+                offset += 6;
+
+                // Apply settings with comprehensive validation
+                const result = self.applySingleSetting(setting_id, setting_value);
+                if (result) |_| {
+                    changes_applied += 1;
+                    std.log.debug("Applied HTTP/2 setting: ID={}, value={}", .{ setting_id, setting_value });
+                } else |err| switch (err) {
+                    error.FlowControlError => {
+                        std.log.err("Flow control error for setting ID {}: value {} exceeds maximum", .{ setting_id, setting_value });
+                        self.peer_settings = previous_settings; // Rollback
+                        return err;
+                    },
+                    error.ProtocolError => {
+                        std.log.err("Protocol error for setting ID {}: invalid value {}", .{ setting_id, setting_value });
+                        self.peer_settings = previous_settings; // Rollback
+                        return err;
+                    },
+                    else => return err,
+                }
+            }
+
+            std.log.info("Successfully applied {} HTTP/2 settings", .{changes_applied});
+
+            // Apply side effects after all settings are validated
+            try self.handleSettingsChanges(previous_settings);
+        }
+
+        fn applySingleSetting(self: *Http2Connection, setting_id: u16, setting_value: u32) !void {
+            switch (setting_id) {
+                @intFromEnum(http2.SettingsId.header_table_size) => {
+                    // RFC 7540: No specific limit, but we impose reasonable bounds
+                    if (setting_value > 1024 * 1024) { // 1MB limit
+                        return error.ProtocolError;
+                    }
+                    self.peer_settings.header_table_size = setting_value;
+                },
+                @intFromEnum(http2.SettingsId.enable_push) => {
+                    // RFC 7540: Must be 0 (disabled) or 1 (enabled)
+                    if (setting_value > 1) {
+                        return error.ProtocolError;
+                    }
+                    self.peer_settings.enable_push = setting_value != 0;
+                },
+                @intFromEnum(http2.SettingsId.max_concurrent_streams) => {
+                    // RFC 7540: No specific limit
+                    self.peer_settings.max_concurrent_streams = setting_value;
+                },
+                @intFromEnum(http2.SettingsId.initial_window_size) => {
+                    // RFC 7540: Must not exceed 2^31-1 (flow control)
+                    if (setting_value > 0x7FFFFFFF) {
+                        return error.FlowControlError;
+                    }
+                    self.peer_settings.initial_window_size = setting_value;
+                },
+                @intFromEnum(http2.SettingsId.max_frame_size) => {
+                    // RFC 7540: Between 2^14 (16384) and 2^24-1 (16777215)
+                    if (setting_value < 16384 or setting_value > 16777215) {
+                        return error.ProtocolError;
+                    }
+                    self.peer_settings.max_frame_size = setting_value;
+                },
+                @intFromEnum(http2.SettingsId.max_header_list_size) => {
+                    // RFC 7540: Advisory limit, no specific bounds but we impose reasonable ones
+                    if (setting_value > 10 * 1024 * 1024) { // 10MB limit
+                        return error.ProtocolError;
+                    }
+                    self.peer_settings.max_header_list_size = setting_value;
+                },
+                else => {
+                    // RFC 7540: Ignore unknown settings identifiers
+                    std.log.debug("Ignoring unknown HTTP/2 setting ID: {}", .{setting_id});
+                },
+            }
+        }
+
+        fn handleSettingsChanges(self: *Http2Connection, previous_settings: http2.Settings) !void {
+            // Handle INITIAL_WINDOW_SIZE changes - adjust existing stream windows
+            if (self.peer_settings.initial_window_size != previous_settings.initial_window_size) {
+                const window_delta = @as(i64, self.peer_settings.initial_window_size) - @as(i64, previous_settings.initial_window_size);
+
+                var stream_iter = self.streams.iterator();
+                while (stream_iter.next()) |entry| {
+                    const stream_state = entry.value_ptr;
+                    const new_window = @as(i64, stream_state.window_size) + window_delta;
+
+                    // RFC 7540: Window size must not exceed 2^31-1
+                    if (new_window > 0x7FFFFFFF or new_window < -0x80000000) {
+                        std.log.err("Stream {} window size overflow: {} + {} = {}", .{ entry.key_ptr.*, stream_state.window_size, window_delta, new_window });
+                        return error.FlowControlError;
+                    }
+
+                    stream_state.window_size = @intCast(new_window);
+                    std.log.debug("Updated stream {} window size by {}: {} -> {}", .{ entry.key_ptr.*, window_delta, stream_state.window_size - @as(i32, @intCast(window_delta)), stream_state.window_size });
+                }
+            }
+
+            // Handle HEADER_TABLE_SIZE changes - resize HPACK encoder/decoder
+            if (self.peer_settings.header_table_size != previous_settings.header_table_size) {
+                // TODO: Resize HPACK dynamic table when available
+                std.log.debug("Header table size changed: {} -> {}", .{ previous_settings.header_table_size, self.peer_settings.header_table_size });
+            }
+
+            // Handle MAX_FRAME_SIZE changes - validate future frame sizes
+            if (self.peer_settings.max_frame_size != previous_settings.max_frame_size) {
+                std.log.debug("Max frame size changed: {} -> {}", .{ previous_settings.max_frame_size, self.peer_settings.max_frame_size });
+            }
+
+            // Handle ENABLE_PUSH changes - track push capability
+            if (self.peer_settings.enable_push != previous_settings.enable_push) {
+                std.log.info("Server push capability changed: {} -> {}", .{ previous_settings.enable_push, self.peer_settings.enable_push });
+            }
         }
 
         fn processWindowUpdateFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
@@ -1315,11 +1451,17 @@ pub const Client = struct {
         }
 
         fn processRstStreamFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
-            _ = payload; // TODO: Process error code
+            if (payload.len != 4) return error.InvalidRstStreamFrame;
 
-            // Mark stream as closed
+            const error_code_value = mem.readInt(u32, payload[0..4], .big);
+            const error_code: http2.ErrorCode = @enumFromInt(error_code_value);
+
+            std.log.debug("Received RST_STREAM for stream {}: {s}", .{ frame_header.stream_id, error_code.toString() });
+
+            // Mark stream as closed and store error code
             if (self.streams.getPtr(frame_header.stream_id)) |stream_state| {
                 stream_state.end_stream_received = true;
+                stream_state.reset_error_code = error_code;
             }
         }
 
@@ -1344,10 +1486,34 @@ pub const Client = struct {
         }
 
         fn processGoawayFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
-            _ = self;
             _ = frame_header;
-            _ = payload;
-            // TODO: Handle connection termination
+
+            if (payload.len < 8) return error.InvalidGoawayFrame;
+
+            const last_stream_id = mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF;
+            const error_code_value = mem.readInt(u32, payload[4..8], .big);
+            const error_code: http2.ErrorCode = @enumFromInt(error_code_value);
+            const debug_data = payload[8..];
+
+            std.log.info("Received GOAWAY: last_stream_id={}, error={s}, debug_len={}", .{ last_stream_id, error_code.toString(), debug_data.len });
+
+            if (debug_data.len > 0) {
+                std.log.debug("GOAWAY debug data: {s}", .{debug_data});
+            }
+
+            // Mark connection as closing - no new streams can be created
+            // Existing streams with ID <= last_stream_id may continue
+            self.connection_window = 0; // Prevent further data sending
+
+            // Close all streams with ID > last_stream_id
+            var stream_iter = self.streams.iterator();
+            while (stream_iter.next()) |entry| {
+                if (entry.key_ptr.* > last_stream_id) {
+                    entry.value_ptr.end_stream_received = true;
+                    entry.value_ptr.reset_error_code = error_code;
+                }
+            }
+
             return error.ConnectionTerminated;
         }
 
@@ -1395,23 +1561,80 @@ pub const Client = struct {
         }
 
         fn sendRequest(self: *Http3Connection, request: *Request, uri_info: UriInfo) !u64 {
-            _ = self;
-            _ = request;
-            _ = uri_info;
-            // TODO: Implement HTTP/3 QUIC connection and QPACK headers
-            return 1; // Stream ID
+
+            // Create HTTP/3 request headers with QPACK compression
+            var headers = ArrayList(http3.QpackEncoder.QpackEntry).init(self.allocator);
+            defer headers.deinit();
+
+            // Add method header
+            const method_str = switch (request.method) {
+                .get => "GET",
+                .post => "POST",
+                .put => "PUT",
+                .delete => "DELETE",
+                .head => "HEAD",
+                .options => "OPTIONS",
+                .patch => "PATCH",
+            };
+            try headers.append(.{ .name = ":method", .value = method_str });
+
+            // Add scheme (HTTPS for HTTP/3)
+            try headers.append(.{ .name = ":scheme", .value = if (uri_info.port == 443) "https" else "https" });
+
+            // Add authority header
+            const authority = if (uri_info.port == 443)
+                uri_info.host
+            else
+                try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ uri_info.host, uri_info.port });
+            defer if (uri_info.port != 443) self.allocator.free(authority);
+            try headers.append(.{ .name = ":authority", .value = authority });
+
+            // Add path
+            try headers.append(.{ .name = ":path", .value = uri_info.path });
+
+            // Add additional headers
+            var header_iter = request.headers.iter();
+            while (header_iter.next()) |entry| {
+                try headers.append(.{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
+            }
+
+            // For now, return stream ID 1 (client-initiated streams are odd)
+            // TODO: Integrate with actual QUIC transport when available
+            std.log.debug("HTTP/3 request prepared with {} headers", .{headers.items.len});
+            return 1;
         }
 
         fn readResponse(self: *Http3Connection, stream_id: u64) !Response {
-            _ = stream_id;
-            // TODO: Implement HTTP/3 response reading
-            return Response.init(self.allocator, .ok);
+            std.log.debug("Reading HTTP/3 response for stream {}", .{stream_id});
+
+            // Create a mock response for now - in a real implementation this would:
+            // 1. Read QUIC packets from the transport
+            // 2. Decode HTTP/3 frames (HEADERS, DATA)
+            // 3. Decompress QPACK headers
+            // 4. Reconstruct the HTTP response
+
+            var response = Response.init(self.allocator, .ok);
+
+            // Add some mock headers that would come from QPACK decompression
+            try response.headers.put(":status", "200");
+            try response.headers.put("content-type", "application/json");
+            try response.headers.put("server", "ferret-http3");
+
+            // Mock response body
+            const body = "{}";
+            response.body = try self.allocator.dupe(u8, body);
+
+            std.log.debug("HTTP/3 response read with status {} and {} headers", .{ @intFromEnum(response.status), response.headers.count() });
+
+            return response;
         }
     };
 
     fn createHttp3Connection(self: *Self, uri_info: UriInfo) !Http3Connection {
-        _ = uri_info;
-        // TODO: Implement HTTP/3 QUIC connection
+        // For now, create basic connection structure
+        // TODO: Integrate full QUIC transport with handshake and encryption
+        std.log.debug("Creating HTTP/3 QUIC connection to {s}:{d}", .{ uri_info.host, uri_info.port });
+
         return Http3Connection{
             .allocator = self.allocator,
         };
@@ -2254,4 +2477,171 @@ test "HTTP server error handling" {
     // Test that server configuration works
     try testing.expect(server.getActiveConnections() == 0);
     try testing.expect(!server.isListening());
+}
+
+test "HTTP/2 Settings parsing - valid settings" {
+    var reactor = try Reactor.init(testing.allocator);
+    defer reactor.deinit();
+
+    var socket_manager = SocketManager.init(testing.allocator, &reactor);
+    defer socket_manager.deinit();
+
+    const socket = Socket{ .uuid = SocketUUID{ .id = 1, .counter = 1 }, .manager = &socket_manager };
+    var http2_conn = Client.Http2Connection.init(testing.allocator, &socket_manager, socket);
+    defer http2_conn.deinit();
+
+    // Test valid settings frame payload
+    var payload = [_]u8{
+        // SETTINGS_INITIAL_WINDOW_SIZE = 32768 (0x8000)
+        0x00, 0x04, 0x00, 0x00, 0x80, 0x00,
+        // SETTINGS_MAX_FRAME_SIZE = 32768 (0x8000)
+        0x00, 0x05, 0x00, 0x00, 0x80, 0x00,
+        // SETTINGS_ENABLE_PUSH = 0 (disabled)
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+    };
+
+    try http2_conn.parseAndApplySettings(&payload);
+
+    // Verify settings were applied
+    try testing.expectEqual(@as(u32, 32768), http2_conn.peer_settings.initial_window_size);
+    try testing.expectEqual(@as(u32, 32768), http2_conn.peer_settings.max_frame_size);
+    try testing.expectEqual(false, http2_conn.peer_settings.enable_push);
+}
+
+test "HTTP/2 Settings parsing - invalid payload length" {
+    var reactor = try Reactor.init(testing.allocator);
+    defer reactor.deinit();
+
+    var socket_manager = SocketManager.init(testing.allocator, &reactor);
+    defer socket_manager.deinit();
+
+    const socket = Socket{ .uuid = SocketUUID{ .id = 1, .counter = 1 }, .manager = &socket_manager };
+    var http2_conn = Client.Http2Connection.init(testing.allocator, &socket_manager, socket);
+    defer http2_conn.deinit();
+
+    // Invalid payload - not multiple of 6 bytes
+    var invalid_payload = [_]u8{ 0x00, 0x01, 0x00, 0x00, 0x01 };
+    try testing.expectError(error.InvalidSettingsFrame, http2_conn.parseAndApplySettings(&invalid_payload));
+}
+
+test "HTTP/2 Settings parsing - flow control error" {
+    var reactor = try Reactor.init(testing.allocator);
+    defer reactor.deinit();
+
+    var socket_manager = SocketManager.init(testing.allocator, &reactor);
+    defer socket_manager.deinit();
+
+    const socket = Socket{ .uuid = SocketUUID{ .id = 1, .counter = 1 }, .manager = &socket_manager };
+    var http2_conn = Client.Http2Connection.init(testing.allocator, &socket_manager, socket);
+    defer http2_conn.deinit();
+
+    // SETTINGS_INITIAL_WINDOW_SIZE with invalid value (> 2^31-1)
+    var payload = [_]u8{
+        0x00, 0x04, 0x80, 0x00, 0x00, 0x00, // Invalid window size
+    };
+
+    try testing.expectError(error.FlowControlError, http2_conn.parseAndApplySettings(&payload));
+}
+
+test "HTTP/2 Settings parsing - protocol error" {
+    var reactor = try Reactor.init(testing.allocator);
+    defer reactor.deinit();
+
+    var socket_manager = SocketManager.init(testing.allocator, &reactor);
+    defer socket_manager.deinit();
+
+    const socket = Socket{ .uuid = SocketUUID{ .id = 1, .counter = 1 }, .manager = &socket_manager };
+    var http2_conn = Client.Http2Connection.init(testing.allocator, &socket_manager, socket);
+    defer http2_conn.deinit();
+
+    // SETTINGS_MAX_FRAME_SIZE with invalid value (< 16384)
+    var payload = [_]u8{
+        0x00, 0x05, 0x00, 0x00, 0x10, 0x00, // 4096 < 16384
+    };
+
+    try testing.expectError(error.ProtocolError, http2_conn.parseAndApplySettings(&payload));
+}
+
+test "HTTP/2 Settings parsing - enable push validation" {
+    var reactor = try Reactor.init(testing.allocator);
+    defer reactor.deinit();
+
+    var socket_manager = SocketManager.init(testing.allocator, &reactor);
+    defer socket_manager.deinit();
+
+    const socket = Socket{ .uuid = SocketUUID{ .id = 1, .counter = 1 }, .manager = &socket_manager };
+    var http2_conn = Client.Http2Connection.init(testing.allocator, &socket_manager, socket);
+    defer http2_conn.deinit();
+
+    // SETTINGS_ENABLE_PUSH with invalid value (> 1)
+    var payload = [_]u8{
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x02, // Invalid push setting
+    };
+
+    try testing.expectError(error.ProtocolError, http2_conn.parseAndApplySettings(&payload));
+}
+
+test "HTTP/2 Settings parsing - unknown settings ignored" {
+    var reactor = try Reactor.init(testing.allocator);
+    defer reactor.deinit();
+
+    var socket_manager = SocketManager.init(testing.allocator, &reactor);
+    defer socket_manager.deinit();
+
+    const socket = Socket{ .uuid = SocketUUID{ .id = 1, .counter = 1 }, .manager = &socket_manager };
+    var http2_conn = Client.Http2Connection.init(testing.allocator, &socket_manager, socket);
+    defer http2_conn.deinit();
+
+    // Unknown setting ID (0xFF) should be ignored
+    var payload = [_]u8{
+        0x00, 0xFF, 0x12, 0x34, 0x56, 0x78, // Unknown setting
+        0x00, 0x04, 0x00, 0x01, 0x00, 0x00, // Valid setting: INITIAL_WINDOW_SIZE = 65536
+    };
+
+    try http2_conn.parseAndApplySettings(&payload);
+
+    // Only valid setting should be applied
+    try testing.expectEqual(@as(u32, 65536), http2_conn.peer_settings.initial_window_size);
+}
+
+test "HTTP/2 Settings parsing - window size updates" {
+    var reactor = try Reactor.init(testing.allocator);
+    defer reactor.deinit();
+
+    var socket_manager = SocketManager.init(testing.allocator, &reactor);
+    defer socket_manager.deinit();
+
+    const socket = Socket{ .uuid = SocketUUID{ .id = 1, .counter = 1 }, .manager = &socket_manager };
+    var http2_conn = Client.Http2Connection.init(testing.allocator, &socket_manager, socket);
+    defer http2_conn.deinit();
+
+    // Add a test stream
+    const stream_id: u31 = 1;
+    const initial_stream_window: i32 = 32768;
+    const stream_state = Client.Http2Connection.Http2StreamState{
+        .window_size = initial_stream_window,
+        .headers_complete = false,
+        .end_stream_received = false,
+        .response_headers = ArrayList(http2.HeaderEntry).init(testing.allocator),
+        .response_data = ArrayList(u8).init(testing.allocator),
+        .reset_error_code = null,
+    };
+    try http2_conn.streams.put(stream_id, stream_state);
+
+    // Update INITIAL_WINDOW_SIZE from default 65535 to 32768
+    var payload = [_]u8{
+        0x00, 0x04, 0x00, 0x00, 0x80, 0x00, // INITIAL_WINDOW_SIZE = 32768
+    };
+
+    try http2_conn.parseAndApplySettings(&payload);
+
+    // Check that stream window was adjusted by the delta (-32767)
+    const updated_stream = http2_conn.streams.get(stream_id).?;
+    const expected_window = initial_stream_window + (32768 - 65535); // -32767
+    try testing.expectEqual(expected_window, updated_stream.window_size);
+
+    // Clean up
+    var stream_cleanup = http2_conn.streams.getPtr(stream_id).?;
+    stream_cleanup.response_headers.deinit();
+    stream_cleanup.response_data.deinit();
 }

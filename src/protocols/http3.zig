@@ -637,6 +637,82 @@ pub const CryptoState = struct {
         return client_hello.toOwnedSlice();
     }
 
+    /// Generate Client Hello with SNI extension for TLS handshake
+    pub fn generateClientHelloWithSni(self: *Self, server_name: []const u8) ![]u8 {
+        // Generate a proper TLS 1.3 Client Hello message for QUIC with SNI
+        var client_hello = std.ArrayList(u8).init(std.heap.page_allocator);
+        errdefer client_hello.deinit();
+
+        // TLS 1.3 Client Hello structure for QUIC
+        try client_hello.append(0x01); // Handshake type: ClientHello
+
+        // Length (will be updated)
+        const length_pos = client_hello.items.len;
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 });
+
+        // TLS version (legacy_version = TLS 1.2 for compatibility)
+        try client_hello.appendSlice(&[_]u8{ 0x03, 0x03 });
+
+        // Random (32 bytes)
+        try client_hello.appendSlice(&self.key_material);
+
+        // Session ID length (0 for QUIC)
+        try client_hello.append(0x00);
+
+        // Cipher suites length and suites
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x06 }); // Length: 6 bytes
+        try client_hello.appendSlice(&[_]u8{ 0x13, 0x01 }); // TLS_AES_128_GCM_SHA256
+        try client_hello.appendSlice(&[_]u8{ 0x13, 0x02 }); // TLS_AES_256_GCM_SHA384
+        try client_hello.appendSlice(&[_]u8{ 0x13, 0x03 }); // TLS_CHACHA20_POLY1305_SHA256
+
+        // Compression methods (none for TLS 1.3)
+        try client_hello.appendSlice(&[_]u8{ 0x01, 0x00 });
+
+        // Extensions
+        const extensions_start = client_hello.items.len;
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extensions length placeholder
+
+        // Server Name Indication (SNI) extension
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extension type: server_name
+        const sni_len_pos = client_hello.items.len;
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extension length placeholder
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Server name list length placeholder
+        try client_hello.append(0x00); // Name type: host_name
+        try client_hello.appendSlice(&[_]u8{ @intCast((server_name.len >> 8) & 0xFF), @intCast(server_name.len & 0xFF) }); // Host name length
+        try client_hello.appendSlice(server_name); // Host name
+
+        // Update SNI extension length
+        const sni_content_len = 2 + 1 + 2 + server_name.len; // list_len + type + name_len + name
+        client_hello.items[sni_len_pos] = @intCast((sni_content_len >> 8) & 0xFF);
+        client_hello.items[sni_len_pos + 1] = @intCast(sni_content_len & 0xFF);
+        client_hello.items[sni_len_pos + 2] = @intCast(((sni_content_len - 2) >> 8) & 0xFF);
+        client_hello.items[sni_len_pos + 3] = @intCast((sni_content_len - 2) & 0xFF);
+
+        // Supported versions extension (TLS 1.3)
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x2B }); // Extension type
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x03 }); // Extension length
+        try client_hello.appendSlice(&[_]u8{ 0x02, 0x03, 0x04 }); // TLS 1.3
+
+        // QUIC transport parameters extension
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x39 }); // Extension type (QUIC transport parameters)
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x08 }); // Extension length
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x01, 0x40, 0x64 }); // Max idle timeout
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x03, 0x02, 0x45, 0xAC }); // Max packet size
+
+        // Update extensions length
+        const extensions_len = client_hello.items.len - extensions_start - 2;
+        client_hello.items[extensions_start] = @intCast((extensions_len >> 8) & 0xFF);
+        client_hello.items[extensions_start + 1] = @intCast(extensions_len & 0xFF);
+
+        // Update total message length
+        const total_len = client_hello.items.len - 4;
+        client_hello.items[length_pos] = @intCast((total_len >> 16) & 0xFF);
+        client_hello.items[length_pos + 1] = @intCast((total_len >> 8) & 0xFF);
+        client_hello.items[length_pos + 2] = @intCast(total_len & 0xFF);
+
+        return client_hello.toOwnedSlice();
+    }
+
     /// Apply packet protection (encryption)
     pub fn protect(self: *Self, packet: []const u8) ![]u8 {
         // Use ChaCha20-Poly1305 AEAD for QUIC packet protection
@@ -1133,7 +1209,11 @@ pub const QuicTransport = struct {
         try self.qpack_encoder.encodeHeader(&header_block, ":method", method);
         try self.qpack_encoder.encodeHeader(&header_block, ":path", path);
         try self.qpack_encoder.encodeHeader(&header_block, ":scheme", "https");
-        try self.qpack_encoder.encodeHeader(&header_block, ":authority", "example.com"); // TODO: Make configurable
+
+        // Generate authority from remote address
+        const authority = try std.fmt.allocPrint(self.allocator, "{}", .{self.connection.remote_address});
+        defer self.allocator.free(authority);
+        try self.qpack_encoder.encodeHeader(&header_block, ":authority", authority);
 
         // Encode additional headers
         for (headers) |header| {
@@ -1323,8 +1403,8 @@ pub const QuicConnection = struct {
 
     /// Enhanced connection establishment with proper QUIC handshake
     pub fn establishConnection(self: *Self, server_name: []const u8) !void {
-        // Send Initial packet with Client Hello
-        const client_hello = try self.crypto_state.generateClientHello();
+        // Generate Client Hello with SNI extension
+        const client_hello = try self.crypto_state.generateClientHelloWithSni(server_name);
         defer self.allocator.free(client_hello);
 
         const crypto_frame = QuicFrame{
@@ -1334,6 +1414,7 @@ pub const QuicConnection = struct {
             .ack_ranges = null,
         };
 
+        std.log.debug("Establishing QUIC connection with SNI: {s}", .{server_name});
         try self.sendPacket(.initial, &[_]QuicFrame{crypto_frame});
         self.connection.state = .handshake;
 
@@ -1344,7 +1425,7 @@ pub const QuicConnection = struct {
         try self.sendHttp3Settings();
 
         self.connection.state = .established;
-        _ = server_name; // TODO: Use for SNI
+        std.log.debug("QUIC connection established with server: {s}", .{server_name});
     }
 
     /// Complete QUIC handshake
