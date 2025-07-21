@@ -302,7 +302,7 @@ pub const Frame = struct {
 };
 
 /// Header entry type
-const HeaderEntry = struct { name: []const u8, value: []const u8 };
+pub const HeaderEntry = struct { name: []const u8, value: []const u8 };
 
 /// Huffman decode table entry
 const HuffmanDecodeEntry = struct {

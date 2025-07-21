@@ -327,6 +327,84 @@ pub const StatusClass = enum {
     unknown,
 };
 
+/// HPACK encoder for HTTP/2 header compression
+const HpackEncoder = struct {
+    dynamic_table: ArrayList(http2.HeaderEntry),
+    max_table_size: u32,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, max_table_size: u32) Self {
+        return Self{
+            .dynamic_table = ArrayList(http2.HeaderEntry).init(allocator),
+            .max_table_size = max_table_size,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.dynamic_table.items) |entry| {
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.value);
+        }
+        self.dynamic_table.deinit();
+    }
+
+    /// Encode headers using HPACK compression
+    pub fn encode(self: *Self, headers: []const http2.HeaderEntry) ![]u8 {
+        var output = std.ArrayList(u8).init(self.allocator);
+        defer output.deinit();
+
+        for (headers) |header| {
+            // For simplicity, use literal header field without indexing
+            // In a production implementation, would check static/dynamic tables first
+
+            // Header field without indexing (pattern: 0000xxxx)
+            try output.append(0x00);
+
+            // Encode header name
+            try self.encodeString(&output, header.name, false);
+
+            // Encode header value
+            try self.encodeString(&output, header.value, false);
+        }
+
+        return try output.toOwnedSlice();
+    }
+
+    fn encodeString(self: *Self, output: *std.ArrayList(u8), str: []const u8, huffman: bool) !void {
+        if (huffman) {
+            // For now, don't use Huffman encoding - just set length with H=0
+            try self.encodeInteger(output, str.len, 7, 0x00);
+        } else {
+            // Literal string encoding (H=0)
+            try self.encodeInteger(output, str.len, 7, 0x00);
+        }
+
+        try output.appendSlice(str);
+    }
+
+    fn encodeInteger(self: *Self, output: *std.ArrayList(u8), value: usize, prefix_bits: u8, flags: u8) !void {
+        _ = self;
+
+        const max_prefix = (@as(usize, 1) << @intCast(prefix_bits)) - 1;
+
+        if (value < max_prefix) {
+            try output.append(@intCast(flags | value));
+        } else {
+            try output.append(@intCast(flags | max_prefix));
+            var remaining = value - max_prefix;
+
+            while (remaining >= 128) {
+                try output.append(@intCast((remaining % 128) | 0x80));
+                remaining /= 128;
+            }
+            try output.append(@intCast(remaining));
+        }
+    }
+};
+
 /// Unified HTTP headers
 pub const Headers = struct {
     map: HashMap([]const u8, []const u8, std.hash_map.StringContext, std.hash_map.default_max_load_percentage),
@@ -920,35 +998,392 @@ pub const Client = struct {
         return response;
     }
 
-    // HTTP/2 connection placeholder
+    // HTTP/2 connection implementation with binary framing and HPACK compression
     const Http2Connection = struct {
         allocator: Allocator,
+        socket_manager: *SocketManager,
+        socket: Socket,
+        connection: http2.Connection,
+        hpack_encoder: HpackEncoder,
+        next_stream_id: u31,
+        connection_window: i32,
+        streams: std.HashMap(u31, Http2StreamState, std.hash_map.AutoContext(u31), std.hash_map.default_max_load_percentage),
+
+        const Http2StreamState = struct {
+            window_size: i32,
+            headers_complete: bool,
+            end_stream_received: bool,
+            response_headers: ArrayList(http2.HeaderEntry),
+            response_data: ArrayList(u8),
+        };
+
+        fn init(allocator: Allocator, socket_manager: *SocketManager, socket: Socket) Http2Connection {
+            return Http2Connection{
+                .allocator = allocator,
+                .socket_manager = socket_manager,
+                .socket = socket,
+                .connection = http2.Connection.init(allocator, false), // false = client
+                .hpack_encoder = HpackEncoder.init(allocator, 4096),
+                .next_stream_id = 1, // Client uses odd stream IDs
+                .connection_window = 65535,
+                .streams = std.HashMap(u31, Http2StreamState, std.hash_map.AutoContext(u31), std.hash_map.default_max_load_percentage).init(allocator),
+            };
+        }
 
         fn deinit(self: *Http2Connection) void {
-            _ = self;
+            // Clean up streams
+            var stream_iter = self.streams.iterator();
+            while (stream_iter.next()) |entry| {
+                for (entry.value_ptr.response_headers.items) |header| {
+                    self.allocator.free(header.name);
+                    self.allocator.free(header.value);
+                }
+                entry.value_ptr.response_headers.deinit();
+                entry.value_ptr.response_data.deinit();
+            }
+            self.streams.deinit();
+
+            self.hpack_encoder.deinit();
+            self.connection.deinit();
         }
 
-        fn sendRequest(self: *Http2Connection, request: *Request, uri_info: UriInfo) !u32 {
-            _ = self;
-            _ = request;
-            _ = uri_info;
-            // TODO: Implement HTTP/2 binary framing and HPACK compression
-            return 1; // Stream ID
+        fn sendConnectionPreface(self: *Http2Connection) !void {
+            // Send HTTP/2 connection preface
+            try self.socket_manager.writeSocket(self.socket.uuid, http2.CONNECTION_PREFACE, null);
+
+            // Send initial SETTINGS frame
+            const settings_frame = try self.buildSettingsFrame();
+            defer self.allocator.free(settings_frame);
+            try self.socket_manager.writeSocket(self.socket.uuid, settings_frame, null);
         }
 
-        fn readResponse(self: *Http2Connection, stream_id: u32) !Response {
-            _ = stream_id;
-            // TODO: Implement HTTP/2 response reading
-            return Response.init(self.allocator, .ok);
+        fn buildSettingsFrame(self: *Http2Connection) ![]u8 {
+            var settings_buffer = std.ArrayList(u8).init(self.allocator);
+            defer settings_buffer.deinit();
+
+            // Build settings payload
+            var settings_data = std.ArrayList(u8).init(self.allocator);
+            defer settings_data.deinit();
+
+            // SETTINGS_HEADER_TABLE_SIZE (default 4096)
+            try settings_data.appendSlice(&mem.toBytes(@as(u16, @intFromEnum(http2.SettingsId.header_table_size)), .big));
+            try settings_data.appendSlice(&mem.toBytes(@as(u32, 4096), .big));
+
+            // SETTINGS_ENABLE_PUSH (false for client)
+            try settings_data.appendSlice(&mem.toBytes(@as(u16, @intFromEnum(http2.SettingsId.enable_push)), .big));
+            try settings_data.appendSlice(&mem.toBytes(@as(u32, 0), .big));
+
+            // SETTINGS_MAX_FRAME_SIZE
+            try settings_data.appendSlice(&mem.toBytes(@as(u16, @intFromEnum(http2.SettingsId.max_frame_size)), .big));
+            try settings_data.appendSlice(&mem.toBytes(@as(u32, 16384), .big));
+
+            // Create SETTINGS frame
+            const frame = http2.Frame.settings(settings_data.items, false);
+
+            // Serialize frame
+            const frame_writer = settings_buffer.writer();
+            try frame.serialize(frame_writer);
+
+            return try settings_buffer.toOwnedSlice();
+        }
+
+        fn sendRequest(self: *Http2Connection, request: *Request, uri_info: UriInfo) !u31 {
+            const stream_id = self.next_stream_id;
+            self.next_stream_id += 2; // Client uses odd stream IDs
+
+            // Initialize stream state
+            const stream_state = Http2StreamState{
+                .window_size = 65535,
+                .headers_complete = false,
+                .end_stream_received = false,
+                .response_headers = ArrayList(http2.HeaderEntry).init(self.allocator),
+                .response_data = ArrayList(u8).init(self.allocator),
+            };
+            try self.streams.put(stream_id, stream_state);
+
+            // Build HTTP/2 request headers using HPACK compression
+            const header_block = try self.buildRequestHeaders(request, uri_info);
+            defer self.allocator.free(header_block);
+
+            // Create and send HEADERS frame
+            const end_stream = (request.body == null);
+            const headers_frame = http2.Frame.headers(stream_id, header_block, end_stream, true);
+
+            var frame_buffer = std.ArrayList(u8).init(self.allocator);
+            defer frame_buffer.deinit();
+            const frame_writer = frame_buffer.writer();
+            try headers_frame.serialize(frame_writer);
+
+            try self.socket_manager.writeSocket(self.socket.uuid, frame_buffer.items, null);
+
+            // Send DATA frame if request has body
+            if (request.body) |body| {
+                const data_frame = http2.Frame.data(stream_id, body, true);
+
+                frame_buffer.clearRetainingCapacity();
+                try data_frame.serialize(frame_writer);
+                try self.socket_manager.writeSocket(self.socket.uuid, frame_buffer.items, null);
+            }
+
+            return stream_id;
+        }
+
+        fn buildRequestHeaders(self: *Http2Connection, request: *Request, uri_info: UriInfo) ![]u8 {
+            var headers = ArrayList(http2.HeaderEntry).init(self.allocator);
+            defer {
+                for (headers.items) |header| {
+                    self.allocator.free(header.name);
+                    self.allocator.free(header.value);
+                }
+                headers.deinit();
+            }
+
+            // Add HTTP/2 pseudo-headers
+            try headers.append(.{ .name = try self.allocator.dupe(u8, ":method"), .value = try self.allocator.dupe(u8, request.method.toString()) });
+            try headers.append(.{ .name = try self.allocator.dupe(u8, ":path"), .value = try self.allocator.dupe(u8, uri_info.path) });
+            try headers.append(.{ .name = try self.allocator.dupe(u8, ":scheme"), .value = try self.allocator.dupe(u8, if (uri_info.is_https) "https" else "http") });
+            try headers.append(.{ .name = try self.allocator.dupe(u8, ":authority"), .value = try self.allocator.dupe(u8, uri_info.host) });
+
+            // Add regular headers
+            var header_iter = request.headers.iter();
+            while (header_iter.next()) |entry| {
+                // Skip headers that are handled by HTTP/2 pseudo-headers or connection-specific
+                const name_lower = std.ascii.allocLowerString(self.allocator, entry.key_ptr.*) catch continue;
+                defer self.allocator.free(name_lower);
+
+                if (mem.eql(u8, name_lower, "host") or
+                    mem.eql(u8, name_lower, "connection") or
+                    mem.eql(u8, name_lower, "upgrade") or
+                    mem.eql(u8, name_lower, "http2-settings"))
+                {
+                    continue;
+                }
+
+                try headers.append(.{ .name = try self.allocator.dupe(u8, entry.key_ptr.*), .value = try self.allocator.dupe(u8, entry.value_ptr.*) });
+            }
+
+            // Encode headers using HPACK
+            return try self.hpack_encoder.encode(headers.items);
+        }
+
+        fn readResponse(self: *Http2Connection, stream_id: u31) !Response {
+            // Read HTTP/2 frames until we have a complete response
+            while (!self.isResponseComplete(stream_id)) {
+                const frame_data = try self.readNextFrame();
+                defer self.allocator.free(frame_data);
+
+                try self.processFrame(frame_data);
+            }
+
+            // Build response from collected headers and data
+            const stream_state = self.streams.get(stream_id) orelse return error.StreamNotFound;
+
+            // Determine status code from :status pseudo-header
+            var status_code: StatusCode = .ok;
+            for (stream_state.response_headers.items) |header| {
+                if (mem.eql(u8, header.name, ":status")) {
+                    const status_int = std.fmt.parseInt(u16, header.value, 10) catch 200;
+                    status_code = @enumFromInt(status_int);
+                    break;
+                }
+            }
+
+            var response = Response.init(self.allocator, status_code);
+            response.version = .http_2_0;
+
+            // Copy headers (skip pseudo-headers)
+            for (stream_state.response_headers.items) |header| {
+                if (!mem.startsWith(u8, header.name, ":")) {
+                    try response.setHeader(header.name, header.value);
+                }
+            }
+
+            // Set response body if present
+            if (stream_state.response_data.items.len > 0) {
+                const body_copy = try self.allocator.dupe(u8, stream_state.response_data.items);
+                response.setBody(body_copy);
+            }
+
+            return response;
+        }
+
+        fn isResponseComplete(self: *Http2Connection, stream_id: u31) bool {
+            const stream_state = self.streams.get(stream_id) orelse return false;
+            return stream_state.headers_complete and stream_state.end_stream_received;
+        }
+
+        fn readNextFrame(self: *Http2Connection) ![]u8 {
+            // Read frame header (9 bytes)
+            var header_buffer: [9]u8 = undefined;
+            _ = try self.socket.read(&header_buffer);
+
+            const frame_header = http2.FrameHeader.parse(&header_buffer) orelse return error.InvalidFrameHeader;
+
+            // Read frame payload
+            var frame_data = try self.allocator.alloc(u8, 9 + frame_header.length);
+            @memcpy(frame_data[0..9], &header_buffer);
+
+            if (frame_header.length > 0) {
+                _ = try self.socket.read(frame_data[9..]);
+            }
+
+            return frame_data;
+        }
+
+        fn processFrame(self: *Http2Connection, frame_data: []const u8) !void {
+            const frame_header = http2.FrameHeader.parse(frame_data) orelse return error.InvalidFrameHeader;
+            const payload = frame_data[9..];
+
+            switch (frame_header.frame_type) {
+                .headers => try self.processHeadersFrame(frame_header, payload),
+                .data => try self.processDataFrame(frame_header, payload),
+                .settings => try self.processSettingsFrame(frame_header, payload),
+                .window_update => try self.processWindowUpdateFrame(frame_header, payload),
+                .rst_stream => try self.processRstStreamFrame(frame_header, payload),
+                .ping => try self.processPingFrame(frame_header, payload),
+                .goaway => try self.processGoawayFrame(frame_header, payload),
+                else => {
+                    // Unknown frame type - ignore per RFC 7540
+                    std.log.debug("Received unknown frame type: {}", .{@intFromEnum(frame_header.frame_type)});
+                },
+            }
+        }
+
+        fn processHeadersFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
+            const stream_state = self.streams.getPtr(frame_header.stream_id) orelse return error.StreamNotFound;
+
+            // Decode HPACK headers
+            try self.connection.hpack_decoder.decode(payload, &stream_state.response_headers);
+
+            if (frame_header.flags.endHeaders()) {
+                stream_state.headers_complete = true;
+            }
+
+            if (frame_header.flags.endStream()) {
+                stream_state.end_stream_received = true;
+            }
+        }
+
+        fn processDataFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
+            const stream_state = self.streams.getPtr(frame_header.stream_id) orelse return error.StreamNotFound;
+
+            // Append data to response body
+            try stream_state.response_data.appendSlice(payload);
+
+            if (frame_header.flags.endStream()) {
+                stream_state.end_stream_received = true;
+            }
+
+            // Send WINDOW_UPDATE for flow control
+            if (payload.len > 0) {
+                try self.sendWindowUpdate(frame_header.stream_id, @intCast(payload.len));
+                try self.sendWindowUpdate(0, @intCast(payload.len)); // Connection-level window update
+            }
+        }
+
+        fn processSettingsFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
+            if (frame_header.flags.ack()) {
+                // SETTINGS ACK - nothing to do
+                return;
+            }
+
+            // Process settings and send ACK
+            _ = payload; // TODO: Parse and apply settings
+
+            const ack_frame = http2.Frame.settings(&[_]u8{}, true);
+            var frame_buffer = std.ArrayList(u8).init(self.allocator);
+            defer frame_buffer.deinit();
+            const frame_writer = frame_buffer.writer();
+            try ack_frame.serialize(frame_writer);
+            try self.socket_manager.writeSocket(self.socket.uuid, frame_buffer.items, null);
+        }
+
+        fn processWindowUpdateFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
+            if (payload.len != 4) return error.InvalidWindowUpdate;
+
+            const window_increment = mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF;
+
+            if (frame_header.stream_id == 0) {
+                // Connection-level window update
+                self.connection_window += @intCast(window_increment);
+            } else {
+                // Stream-level window update
+                if (self.streams.getPtr(frame_header.stream_id)) |stream_state| {
+                    stream_state.window_size += @intCast(window_increment);
+                }
+            }
+        }
+
+        fn processRstStreamFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
+            _ = payload; // TODO: Process error code
+
+            // Mark stream as closed
+            if (self.streams.getPtr(frame_header.stream_id)) |stream_state| {
+                stream_state.end_stream_received = true;
+            }
+        }
+
+        fn processPingFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
+            if (frame_header.flags.ack()) {
+                // PING ACK - nothing to do
+                return;
+            }
+
+            // Send PING ACK
+            if (payload.len == 8) {
+                var ping_data: [8]u8 = undefined;
+                @memcpy(&ping_data, payload[0..8]);
+                const ping_ack = http2.Frame.ping(ping_data, true);
+
+                var frame_buffer = std.ArrayList(u8).init(self.allocator);
+                defer frame_buffer.deinit();
+                const frame_writer = frame_buffer.writer();
+                try ping_ack.serialize(frame_writer);
+                try self.socket_manager.writeSocket(self.socket.uuid, frame_buffer.items, null);
+            }
+        }
+
+        fn processGoawayFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
+            _ = self;
+            _ = frame_header;
+            _ = payload;
+            // TODO: Handle connection termination
+            return error.ConnectionTerminated;
+        }
+
+        fn sendWindowUpdate(self: *Http2Connection, stream_id: u31, increment: u31) !void {
+            const window_frame = http2.Frame.windowUpdate(stream_id, increment);
+
+            var frame_buffer = std.ArrayList(u8).init(self.allocator);
+            defer frame_buffer.deinit();
+            const frame_writer = frame_buffer.writer();
+            try window_frame.serialize(frame_writer);
+            try self.socket_manager.writeSocket(self.socket.uuid, frame_buffer.items, null);
         }
     };
 
     fn createHttp2Connection(self: *Self, uri_info: UriInfo) !Http2Connection {
-        _ = uri_info;
-        // TODO: Implement HTTP/2 connection with TLS and ALPN
-        return Http2Connection{
-            .allocator = self.allocator,
+        // Create socket connection
+        const address = try net.Address.resolveIp(uri_info.host, uri_info.port);
+        var socket_manager = SocketManager.init(self.allocator);
+
+        // Establish connection
+        const protocol = Protocol{
+            .onReady = null,
+            .onData = null,
+            .onError = null,
+            .onClose = null,
         };
+
+        const socket = try socket_manager.connect(SocketAddress.fromStdAddress(address), protocol);
+
+        // Initialize HTTP/2 connection
+        var http2_conn = Http2Connection.init(self.allocator, &socket_manager, socket);
+
+        // Send connection preface and initial settings
+        try http2_conn.sendConnectionPreface();
+
+        return http2_conn;
     }
 
     // HTTP/3 connection placeholder
