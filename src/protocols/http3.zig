@@ -1168,15 +1168,76 @@ pub const QuicTransport = struct {
 
     fn getHeaderLength(self: *Self, header: *const QuicPacketHeader) usize {
         _ = self;
-        _ = header;
-        // Simplified: return fixed header length
-        return 20;
+
+        // Calculate actual QUIC header length based on packet type and connection ID lengths
+        var length: usize = 1; // First byte (header form + flags)
+
+        if (header.header_form) {
+            // Long header packet
+            length += 4; // Version (4 bytes)
+            length += 1; // Dest connection ID length
+            length += header.dest_conn_id.len; // Dest connection ID
+            length += 1; // Src connection ID length
+            length += header.src_conn_id.len; // Src connection ID
+
+            // Add packet number length (variable, typically 1-4 bytes)
+            // For now, assume 4 bytes for packet number
+            // TODO: Implement proper variable-length packet number encoding
+            length += 4;
+
+            // Additional fields for specific packet types
+            switch (header.packet_type) {
+                .initial, .zero_rtt => {
+                    // These packet types include token and length fields
+                    // TODO: Add proper token length calculation when tokens are implemented
+                    length += 1; // Token length (assume 0 for now)
+                    length += 2; // Length field (varint, assume 2 bytes)
+                },
+                .handshake, .retry => {
+                    length += 2; // Length field (varint, assume 2 bytes)
+                },
+            }
+        } else {
+            // Short header packet (1-RTT)
+            length += header.dest_conn_id.len; // Dest connection ID
+            length += 4; // Packet number (assume 4 bytes)
+        }
+
+        return length;
     }
 
     fn shouldSendAck(self: *Self, header: *const QuicPacketHeader) bool {
         _ = self;
-        _ = header;
-        // Simplified: always send ACK for now
+
+        // ACK should be sent for:
+        // 1. All ack-eliciting packets (DATA, STREAM, etc.)
+        // 2. Every second packet received (immediate ACK)
+        // 3. After a delay timer expires
+        // Don't ACK: ACK-only packets, CONNECTION_CLOSE packets in draining state
+
+        switch (header.packet_type) {
+            .initial, .handshake => {
+                // Always ACK handshake packets for connection establishment
+                return true;
+            },
+            .zero_rtt => {
+                // ACK 0-RTT packets to confirm processing
+                return true;
+            },
+            .retry => {
+                // Don't ACK retry packets - they trigger a new Initial packet
+                return false;
+            },
+        }
+
+        // For short header (1-RTT) packets, we should implement more sophisticated logic:
+        // TODO: Implement proper ACK frequency control based on:
+        // - Packet gaps and reordering
+        // - ACK delay timer
+        // - Maximum ACK delay
+        // - Whether packet contains ack-eliciting frames
+
+        // For now, ACK all 1-RTT packets to ensure reliability
         return true;
     }
 
