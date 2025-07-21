@@ -1,7 +1,7 @@
 //! High-performance Socket I/O wrapper for Ferret
 //!
 //! This module provides a comprehensive socket implementation with:
-//! - Protocol-based event handling inspired by facil.io
+//! - Protocol-based event handling
 //! - Type-safe UUID-based connection management
 //! - Integration with Ferret's reactor system
 //! - Zero-copy operations where possible
@@ -442,7 +442,7 @@ pub const SocketManager = struct {
     }
 
     fn handleAccept(self: *Self, registration: *SocketRegistration) void {
-        // Batch accept up to 4 connections per event (like facil.io)
+        // Batch accept up to 4 connections per event
         var accepted_count: u32 = 0;
         while (accepted_count < 4) {
             const socket = self.accept(registration.uuid, registration.protocol) catch |err| {

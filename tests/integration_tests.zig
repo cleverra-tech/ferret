@@ -257,7 +257,7 @@ fn runMemoryManagementTests(allocator: std.mem.Allocator) !void {
 }
 
 fn testMemoryLeakDetection(allocator: std.mem.Allocator) !void {
-    var tracker = TestFramework.MemoryTracker.init(allocator);
+    var tracker = try TestFramework.MemoryTracker.init(allocator);
     defer tracker.deinit();
 
     // Simulate some allocations

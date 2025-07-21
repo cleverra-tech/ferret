@@ -267,9 +267,359 @@ pub const TestSummary = struct {
         }
     }
 
+    /// Generate JUnit XML output for CI/CD integration
+    /// Follows the JUnit XML format specification for maximum compatibility
     pub fn printJUnit(self: TestSummary) !void {
-        // TODO: Implement JUnit XML output for CI integration
+        const stdout = std.io.getStdOut().writer();
+        try self.writeJUnitToWriter(stdout);
+    }
+
+    /// Write JUnit XML to a specific file
+    pub fn writeJUnitToFile(self: TestSummary, file_path: []const u8) !void {
+        const file = try std.fs.cwd().createFile(file_path, .{});
+        defer file.close();
+
+        // Generate XML content in memory first
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
+        var buffer = std.ArrayList(u8).init(allocator);
+        defer buffer.deinit();
+
+        try self.writeJUnitToWriter(buffer.writer());
+        try file.writeAll(buffer.items);
+    }
+
+    /// Write JUnit XML to any writer (core implementation)
+    pub fn writeJUnitToWriter(self: TestSummary, writer: anytype) !void {
+        // XML header
+        try writer.writeAll("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+
+        // Root testsuites element with summary statistics
+        try writer.print("<testsuites tests=\"{}\" failures=\"{}\" errors=\"{}\" skipped=\"{}\" time=\"{d:.3}\">\n", .{
+            self.total_tests,
+            self.failed,
+            self.errors + self.timeouts, // Timeouts are treated as errors in JUnit
+            self.skipped,
+            self.total_duration_ms / 1000.0, // Convert to seconds
+        });
+
+        // Generate testsuite for each suite
+        for (self.suites.items) |suite| {
+            try self.writeTestSuite(writer, suite);
+        }
+
+        // Close root element
+        try writer.writeAll("</testsuites>\n");
+    }
+
+    /// Write a single test suite to XML
+    fn writeTestSuite(self: TestSummary, writer: anytype, suite: *TestSuite) !void {
+        // Calculate suite-specific statistics
+        var suite_passed: u32 = 0;
+        var suite_failed: u32 = 0;
+        var suite_errors: u32 = 0;
+        var suite_skipped: u32 = 0;
+        var suite_duration: f64 = 0;
+
+        for (suite.tests.items) |test_case| {
+            suite_duration += test_case.duration_ms();
+            switch (test_case.result) {
+                .pass => suite_passed += 1,
+                .fail => suite_failed += 1,
+                .skip => suite_skipped += 1,
+                .timeout, .@"error" => suite_errors += 1,
+            }
+        }
+
+        const suite_total = suite.tests.items.len;
+
+        // Write testsuite element with attributes
+        try writer.print("  <testsuite name=\"{s}\" tests=\"{}\" failures=\"{}\" errors=\"{}\" skipped=\"{}\" time=\"{d:.3}\"", .{
+            suite.name,
+            suite_total,
+            suite_failed,
+            suite_errors,
+            suite_skipped,
+            suite_duration / 1000.0, // Convert to seconds
+        });
+
+        // Add timestamp (ISO 8601 format)
+        const timestamp = std.time.timestamp();
+        try writer.print(" timestamp=\"{d}\"", .{timestamp});
+
+        try writer.writeAll(">\n");
+
+        // Write properties section if needed
+        try writer.writeAll("    <properties>\n");
+        try writer.print("      <property name=\"test.framework\" value=\"Ferret Testing Framework\"/>\n", .{});
+        try writer.print("      <property name=\"test.suite.category\" value=\"{s}\"/>\n", .{if (suite.tests.items.len > 0) suite.tests.items[0].category.toString() else "unknown"});
+        try writer.writeAll("    </properties>\n");
+
+        // Write individual test cases
+        for (suite.tests.items) |test_case| {
+            try self.writeTestCase(writer, test_case);
+        }
+
+        try writer.writeAll("  </testsuite>\n");
+    }
+
+    /// Write a single test case to XML
+    fn writeTestCase(self: TestSummary, writer: anytype, test_case: TestCase) !void {
+
+        // Basic testcase element
+        try writer.print("    <testcase name=\"{s}\" classname=\"{s}.{s}\" time=\"{d:.3}\"", .{
+            test_case.name,
+            test_case.category.toString(),
+            test_case.priority.toString(),
+            test_case.duration_ms() / 1000.0, // Convert to seconds
+        });
+
+        // Handle different test results
+        switch (test_case.result) {
+            .pass => {
+                // Successful test - just close the element
+                try writer.writeAll("/>\n");
+            },
+            .fail => {
+                try writer.writeAll(">\n");
+                try writer.writeAll("      <failure");
+                if (test_case.error_message) |msg| {
+                    try writer.writeAll(" message=\"");
+                    try self.writeEscapedXML(writer, msg);
+                    try writer.writeAll("\"");
+                }
+                try writer.writeAll(" type=\"AssertionFailure\">");
+                if (test_case.error_message) |msg| {
+                    try self.writeEscapedXML(writer, msg);
+                }
+                try writer.writeAll("</failure>\n");
+                try writer.writeAll("    </testcase>\n");
+            },
+            .@"error" => {
+                try writer.writeAll(">\n");
+                try writer.writeAll("      <error");
+                if (test_case.error_message) |msg| {
+                    try writer.writeAll(" message=\"");
+                    try self.writeEscapedXML(writer, msg);
+                    try writer.writeAll("\"");
+                }
+                try writer.writeAll(" type=\"TestError\">");
+                if (test_case.error_message) |msg| {
+                    try self.writeEscapedXML(writer, msg);
+                }
+                try writer.writeAll("</error>\n");
+                try writer.writeAll("    </testcase>\n");
+            },
+            .timeout => {
+                try writer.writeAll(">\n");
+                try writer.print("      <error message=\"Test timed out after {}ms\" type=\"TimeoutError\">", .{test_case.timeout_ms});
+                try writer.print("Test case '{s}' exceeded the timeout limit of {}ms", .{ test_case.name, test_case.timeout_ms });
+                try writer.writeAll("</error>\n");
+                try writer.writeAll("    </testcase>\n");
+            },
+            .skip => {
+                try writer.writeAll(">\n");
+                try writer.writeAll("      <skipped");
+                if (test_case.error_message) |msg| {
+                    try writer.writeAll(" message=\"");
+                    try self.writeEscapedXML(writer, msg);
+                    try writer.writeAll("\"");
+                } else {
+                    try writer.writeAll(" message=\"Test skipped\"");
+                }
+                try writer.writeAll("/>\n");
+                try writer.writeAll("    </testcase>\n");
+            },
+        }
+    }
+
+    /// Escape XML special characters to prevent XML injection and ensure validity
+    fn writeEscapedXML(self: TestSummary, writer: anytype, text: []const u8) !void {
         _ = self;
+
+        for (text) |char| {
+            switch (char) {
+                '<' => try writer.writeAll("&lt;"),
+                '>' => try writer.writeAll("&gt;"),
+                '&' => try writer.writeAll("&amp;"),
+                '"' => try writer.writeAll("&quot;"),
+                '\'' => try writer.writeAll("&apos;"),
+                // Control characters that are invalid in XML
+                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => try writer.print("&#x{X:0>2};", .{char}),
+                else => try writer.writeByte(char),
+            }
+        }
+    }
+};
+
+/// Tracking allocator for precise memory monitoring
+/// Uses GeneralPurposeAllocator with leak detection for accurate tracking
+pub const TrackingAllocator = struct {
+    gpa: std.heap.GeneralPurposeAllocator(.{
+        .enable_memory_limit = false,
+        .thread_safe = true,
+    }),
+    allocation_count: u32 = 0,
+    deallocation_count: u32 = 0,
+    total_allocated: usize = 0,
+    total_deallocated: usize = 0,
+    peak_memory: usize = 0,
+    mutex: std.Thread.Mutex = .{},
+
+    const Self = @This();
+
+    pub fn init(backing_allocator: Allocator) Self {
+        _ = backing_allocator; // We use our own GPA for accurate tracking
+        return Self{
+            .gpa = std.heap.GeneralPurposeAllocator(.{
+                .enable_memory_limit = false,
+                .thread_safe = true,
+            }){},
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        _ = self.gpa.deinit();
+    }
+
+    pub fn allocator(self: *Self) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .free = free,
+                .remap = remap,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, ptr_align: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        const result = self.gpa.allocator().rawAlloc(len, ptr_align, ret_addr);
+        if (result) |_| {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            self.allocation_count += 1;
+            self.total_allocated += len;
+
+            const current = self.total_allocated - self.total_deallocated;
+            if (current > self.peak_memory) {
+                self.peak_memory = current;
+            }
+        }
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        const result = self.gpa.allocator().rawResize(buf, buf_align, new_len, ret_addr);
+        if (result) {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const old_len = buf.len;
+            if (new_len > old_len) {
+                const additional = new_len - old_len;
+                self.total_allocated += additional;
+
+                const current = self.total_allocated - self.total_deallocated;
+                if (current > self.peak_memory) {
+                    self.peak_memory = current;
+                }
+            } else if (new_len < old_len) {
+                const freed = old_len - new_len;
+                self.total_deallocated += freed;
+            }
+        }
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.deallocation_count += 1;
+        self.total_deallocated += buf.len;
+
+        self.gpa.allocator().rawFree(buf, buf_align, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, old_len: usize, new_len: usize) ?[*]u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        _ = old_len; // Unused, we track based on actual allocation sizes
+        const ret_addr = @returnAddress();
+
+        // Use the backing allocator's realloc
+        if (self.gpa.allocator().rawAlloc(new_len, buf_align, ret_addr)) |new_ptr| {
+            // Copy data if new allocation succeeded
+            @memcpy(new_ptr[0..@min(buf.len, new_len)], buf[0..@min(buf.len, new_len)]);
+
+            // Free old allocation
+            self.gpa.allocator().rawFree(buf, buf_align, ret_addr);
+
+            // Update tracking
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Account for reallocation as new alloc + free
+            self.allocation_count += 1;
+            self.deallocation_count += 1;
+            self.total_allocated += new_len;
+            self.total_deallocated += buf.len;
+
+            const current = self.total_allocated - self.total_deallocated;
+            if (current > self.peak_memory) {
+                self.peak_memory = current;
+            }
+
+            return new_ptr;
+        }
+
+        return null;
+    }
+
+    pub fn reset(self: *Self) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.allocation_count = 0;
+        self.deallocation_count = 0;
+        self.total_allocated = 0;
+        self.total_deallocated = 0;
+        self.peak_memory = 0;
+    }
+
+    pub fn getStats(self: *Self) struct {
+        allocation_count: u32,
+        deallocation_count: u32,
+        total_allocated: usize,
+        total_deallocated: usize,
+        current_allocated: usize,
+        peak_memory: usize,
+        has_leaks: bool,
+    } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const current = self.total_allocated - self.total_deallocated;
+
+        return .{
+            .allocation_count = self.allocation_count,
+            .deallocation_count = self.deallocation_count,
+            .total_allocated = self.total_allocated,
+            .total_deallocated = self.total_deallocated,
+            .current_allocated = current,
+            .peak_memory = self.peak_memory,
+            .has_leaks = current > 0,
+        };
     }
 };
 
@@ -287,101 +637,162 @@ pub const Benchmark = struct {
     }
 
     pub fn run(self: Benchmark, comptime func: anytype, args: anytype) !PerformanceMetrics {
-        var tracking_allocator = std.heap.GeneralPurposeAllocator(.{
-            .enable_memory_limit = false,
-            .thread_safe = true,
-        }){};
-        defer _ = tracking_allocator.deinit();
-        const tracked_alloc = tracking_allocator.allocator();
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        defer _ = gpa.deinit();
 
-        // Warmup
+        var tracking_allocator = TrackingAllocator.init(gpa.allocator());
+        defer tracking_allocator.deinit();
+
+        // Warmup phase
         for (0..self.warmup_iterations) |_| {
-            _ = try func(tracked_alloc, args);
+            _ = try func(tracking_allocator.allocator(), args);
         }
 
-        // Reset tracking
-        _ = tracking_allocator.deinit();
-        tracking_allocator = std.heap.GeneralPurposeAllocator(.{
-            .enable_memory_limit = false,
-            .thread_safe = true,
-        }){};
-        const fresh_alloc = tracking_allocator.allocator();
+        // Reset tracking for actual measurement
+        tracking_allocator.reset();
 
         const start_time = std.time.nanoTimestamp();
 
         for (0..self.iterations) |_| {
-            _ = try func(fresh_alloc, args);
+            _ = try func(tracking_allocator.allocator(), args);
         }
 
         const end_time = std.time.nanoTimestamp();
+        const stats = tracking_allocator.getStats();
 
         return PerformanceMetrics{
             .duration_ns = @intCast(end_time - start_time),
-            .memory_used = 0, // TODO: Implement proper memory tracking
-            .allocations = 0, // TODO: Track allocations count
-            .deallocations = 0, // TODO: Track deallocations count
-            .peak_memory = 0, // TODO: Implement peak memory tracking
+            .memory_used = stats.total_allocated,
+            .allocations = stats.allocation_count,
+            .deallocations = stats.deallocation_count,
+            .peak_memory = stats.peak_memory,
             .iterations = self.iterations,
         };
     }
 };
 
-/// Memory leak detector
+/// Enhanced memory leak detector using TrackingAllocator
 pub const MemoryTracker = struct {
-    allocator: Allocator,
+    backing_allocator: Allocator,
+    tracking_allocator: TrackingAllocator,
     allocations: std.AutoHashMap(usize, AllocationInfo),
-    total_allocated: usize = 0,
-    total_freed: usize = 0,
+    enabled: bool = true,
 
     const AllocationInfo = struct {
         size: usize,
         timestamp: i128,
-        stack_trace: ?[]const usize = null,
+        stack_trace: ?std.builtin.StackTrace = null,
     };
 
-    pub fn init(allocator: Allocator) MemoryTracker {
-        return MemoryTracker{
-            .allocator = allocator,
-            .allocations = std.AutoHashMap(usize, AllocationInfo).init(allocator),
+    const Self = @This();
+
+    pub fn init(backing_allocator: Allocator) !Self {
+        const tracking = TrackingAllocator.init(backing_allocator);
+        return Self{
+            .backing_allocator = backing_allocator,
+            .tracking_allocator = tracking,
+            .allocations = std.AutoHashMap(usize, AllocationInfo).init(backing_allocator),
         };
     }
 
-    pub fn deinit(self: *MemoryTracker) void {
+    pub fn deinit(self: *Self) void {
+        self.tracking_allocator.deinit();
         self.allocations.deinit();
     }
 
-    pub fn trackAllocation(self: *MemoryTracker, ptr: usize, size: usize) !void {
+    pub fn allocator(self: *Self) Allocator {
+        if (!self.enabled) {
+            return self.backing_allocator;
+        }
+        return self.tracking_allocator.allocator();
+    }
+
+    pub fn enable(self: *Self) void {
+        self.enabled = true;
+    }
+
+    pub fn disable(self: *Self) void {
+        self.enabled = false;
+    }
+
+    pub fn reset(self: *Self) void {
+        self.tracking_allocator.reset();
+        self.allocations.clearAndFree();
+    }
+
+    pub fn trackAllocation(self: *Self, ptr: usize, size: usize) !void {
+        if (!self.enabled) return;
+
         const info = AllocationInfo{
             .size = size,
             .timestamp = std.time.nanoTimestamp(),
+            .stack_trace = null, // Stack trace collection would require more setup
         };
         try self.allocations.put(ptr, info);
-        self.total_allocated += size;
     }
 
-    pub fn trackFree(self: *MemoryTracker, ptr: usize) void {
-        if (self.allocations.fetchRemove(ptr)) |entry| {
-            self.total_freed += entry.value.size;
-        }
+    pub fn trackFree(self: *Self, ptr: usize) void {
+        if (!self.enabled) return;
+
+        _ = self.allocations.remove(ptr);
     }
 
-    pub fn checkLeaks(self: MemoryTracker) !void {
-        if (self.allocations.count() > 0) {
-            std.log.err("Memory leaks detected: {} allocations not freed", .{self.allocations.count()});
-            var iter = self.allocations.iterator();
-            while (iter.next()) |entry| {
-                std.log.err("  Leaked: {} bytes at 0x{X}", .{ entry.value_ptr.size, entry.key_ptr.* });
+    pub fn checkLeaks(self: *Self) !void {
+        const stats = self.tracking_allocator.getStats();
+
+        if (stats.has_leaks) {
+            std.log.err("Memory leaks detected:", .{});
+            std.log.err("  Current allocated: {} bytes", .{stats.current_allocated});
+            std.log.err("  Total allocations: {}", .{stats.allocation_count});
+            std.log.err("  Total deallocations: {}", .{stats.deallocation_count});
+            std.log.err("  Peak memory usage: {} bytes", .{stats.peak_memory});
+
+            if (self.allocations.count() > 0) {
+                std.log.err("  Detailed leak information:");
+                var iter = self.allocations.iterator();
+                while (iter.next()) |entry| {
+                    std.log.err("    {} bytes at 0x{X} (allocated at {}ns)", .{ entry.value_ptr.size, entry.key_ptr.*, entry.value_ptr.timestamp });
+                }
             }
+
             return error.MemoryLeak;
         }
     }
 
-    pub fn getStats(self: MemoryTracker) struct { allocated: usize, freed: usize, leaked: usize } {
+    pub fn getStats(self: *Self) struct {
+        allocated: usize,
+        freed: usize,
+        leaked: usize,
+        peak: usize,
+        allocation_count: u32,
+        deallocation_count: u32,
+    } {
+        const tracking_stats = self.tracking_allocator.getStats();
+
         return .{
-            .allocated = self.total_allocated,
-            .freed = self.total_freed,
-            .leaked = self.total_allocated - self.total_freed,
+            .allocated = tracking_stats.total_allocated,
+            .freed = tracking_stats.total_deallocated,
+            .leaked = tracking_stats.current_allocated,
+            .peak = tracking_stats.peak_memory,
+            .allocation_count = tracking_stats.allocation_count,
+            .deallocation_count = tracking_stats.deallocation_count,
         };
+    }
+
+    pub fn printReport(self: *Self) void {
+        const stats = self.getStats();
+
+        std.debug.print("\n=== Memory Tracking Report ===\n");
+        std.debug.print("Total allocated:   {} bytes ({} allocations)\n", .{ stats.allocated, stats.allocation_count });
+        std.debug.print("Total freed:       {} bytes ({} deallocations)\n", .{ stats.freed, stats.deallocation_count });
+        std.debug.print("Currently leaked:  {} bytes\n", .{stats.leaked});
+        std.debug.print("Peak memory usage: {} bytes\n", .{stats.peak});
+
+        if (stats.leaked > 0) {
+            std.debug.print("{}WARNING: Memory leaks detected!\x1b[0m\n", .{TestResult.fail.color()});
+        } else {
+            std.debug.print("{}No memory leaks detected.\x1b[0m\n", .{TestResult.pass.color()});
+        }
     }
 };
 
@@ -597,4 +1008,413 @@ test "PerformanceMetrics calculations" {
     try Assert.approximatelyEquals(1000.0, metrics.opsPerSecond(), 0.1);
     try Assert.approximatelyEquals(1_000_000.0, metrics.nsPerOp(), 0.1);
     try Assert.isFalse(metrics.memoryLeaked());
+}
+
+test "TrackingAllocator memory tracking" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var tracking = TrackingAllocator.init(gpa.allocator());
+    const alloc = tracking.allocator();
+
+    // Test basic allocation tracking
+    const ptr1 = try alloc.alloc(u8, 100);
+    const stats1 = tracking.getStats();
+    try Assert.equals(u32, 1, stats1.allocation_count);
+    try Assert.equals(usize, 100, stats1.total_allocated);
+    try Assert.equals(usize, 100, stats1.current_allocated);
+    try Assert.equals(usize, 100, stats1.peak_memory);
+
+    // Test multiple allocations
+    const ptr2 = try alloc.alloc(u8, 200);
+    const stats2 = tracking.getStats();
+    try Assert.equals(u32, 2, stats2.allocation_count);
+    try Assert.equals(usize, 300, stats2.total_allocated);
+    try Assert.equals(usize, 300, stats2.current_allocated);
+    try Assert.equals(usize, 300, stats2.peak_memory);
+
+    // Test deallocation tracking
+    alloc.free(ptr1);
+    const stats3 = tracking.getStats();
+    try Assert.equals(u32, 1, stats3.deallocation_count);
+    try Assert.equals(usize, 100, stats3.total_deallocated);
+    try Assert.equals(usize, 200, stats3.current_allocated);
+    try Assert.equals(usize, 300, stats3.peak_memory); // Peak should remain
+
+    // Clean up
+    alloc.free(ptr2);
+    const stats4 = tracking.getStats();
+    try Assert.equals(u32, 2, stats4.deallocation_count);
+    try Assert.equals(usize, 300, stats4.total_deallocated);
+    try Assert.equals(usize, 0, stats4.current_allocated);
+    try Assert.isFalse(stats4.has_leaks);
+}
+
+test "MemoryTracker leak detection" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var tracker = try MemoryTracker.init(gpa.allocator());
+    defer tracker.deinit();
+
+    const alloc = tracker.allocator();
+
+    // Test no leaks scenario
+    {
+        const ptr = try alloc.alloc(u8, 50);
+        alloc.free(ptr);
+
+        const stats = tracker.getStats();
+        try Assert.equals(usize, 0, stats.leaked);
+    }
+
+    // Reset for leak test
+    tracker.reset();
+
+    // Test leak detection and then properly free
+    {
+        const ptr = try alloc.alloc(u8, 100);
+
+        // Check that tracker detects the allocated memory
+        var stats = tracker.getStats();
+        try Assert.equals(usize, 100, stats.leaked);
+        try Assert.equals(usize, 100, stats.allocated);
+        try Assert.equals(usize, 0, stats.freed);
+
+        // Now properly free to avoid actual leak
+        alloc.free(ptr);
+        stats = tracker.getStats();
+        try Assert.equals(usize, 0, stats.leaked);
+    }
+}
+
+test "Benchmark with memory tracking" {
+    // Simple function to benchmark that allocates memory
+    const TestFn = struct {
+        fn allocateAndFree(alloc: Allocator, size: usize) !void {
+            const ptr = try alloc.alloc(u8, size);
+            defer alloc.free(ptr);
+
+            // Do some work with the memory
+            for (ptr, 0..) |*byte, i| {
+                byte.* = @intCast(i % 256);
+            }
+        }
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var benchmark = Benchmark.init(gpa.allocator(), 100);
+    benchmark.warmup_iterations = 10; // Reduce for faster test
+
+    const metrics = try benchmark.run(TestFn.allocateAndFree, @as(usize, 1024));
+
+    // Verify we tracked memory operations
+    try Assert.isTrue(metrics.allocations > 0);
+    try Assert.isTrue(metrics.deallocations > 0);
+    try Assert.isTrue(metrics.memory_used > 0);
+    try Assert.isTrue(metrics.peak_memory > 0);
+    try Assert.equals(u32, 100, metrics.iterations);
+
+    // Should have no leaks (allocations == deallocations)
+    try Assert.isFalse(metrics.memoryLeaked());
+}
+
+test "TrackingAllocator allocation lifecycle" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var tracking = TrackingAllocator.init(gpa.allocator());
+    defer tracking.deinit();
+    const alloc = tracking.allocator();
+
+    // Test basic allocation and free cycle
+    const ptr1 = try alloc.alloc(u8, 100);
+    const stats1 = tracking.getStats();
+    try Assert.equals(u32, 1, stats1.allocation_count);
+    try Assert.isTrue(stats1.current_allocated >= 100);
+
+    // Allocate more memory
+    const ptr2 = try alloc.alloc(u8, 200);
+    const stats2 = tracking.getStats();
+    try Assert.equals(u32, 2, stats2.allocation_count);
+    try Assert.isTrue(stats2.current_allocated >= 300);
+
+    // Free first allocation
+    alloc.free(ptr1);
+    const stats3 = tracking.getStats();
+    try Assert.equals(u32, 1, stats3.deallocation_count);
+    try Assert.isTrue(stats3.current_allocated >= 200);
+    try Assert.isTrue(stats3.current_allocated < stats2.current_allocated);
+
+    // Free second allocation
+    alloc.free(ptr2);
+    const stats4 = tracking.getStats();
+    try Assert.equals(u32, 2, stats4.deallocation_count);
+    try Assert.equals(usize, 0, stats4.current_allocated);
+    try Assert.isFalse(stats4.has_leaks);
+}
+
+test "JUnit XML generation basic functionality" {
+    var suite = TestSuite.init(std.testing.allocator, "Core Tests", "Basic functionality tests");
+    defer suite.deinit();
+
+    // Add some test cases with different results
+    const passing_test = TestCase{
+        .name = "test_passing",
+        .category = .unit,
+        .priority = .high,
+        .description = "A passing test",
+        .result = .pass,
+        .start_time = 1000000000, // 1ms in nanoseconds
+        .end_time = 1005000000, // 5ms in nanoseconds
+    };
+
+    const failing_test = TestCase{
+        .name = "test_failing",
+        .category = .unit,
+        .priority = .medium,
+        .description = "A failing test",
+        .result = .fail,
+        .error_message = "Expected 42 but got 24",
+        .start_time = 2000000000,
+        .end_time = 2003000000,
+    };
+
+    const skipped_test = TestCase{
+        .name = "test_skipped",
+        .category = .integration,
+        .priority = .low,
+        .description = "A skipped test",
+        .result = .skip,
+        .error_message = "Feature not implemented",
+        .start_time = 0,
+        .end_time = 0,
+    };
+
+    try suite.addTest(passing_test);
+    try suite.addTest(failing_test);
+    try suite.addTest(skipped_test);
+
+    var summary = TestSummary.init(std.testing.allocator);
+    defer summary.deinit();
+    try summary.addSuite(&suite);
+
+    // Generate XML to a buffer
+    var buffer = std.ArrayList(u8).init(std.testing.allocator);
+    defer buffer.deinit();
+
+    try summary.writeJUnitToWriter(buffer.writer());
+    const xml = buffer.items;
+
+    // Verify XML structure and content
+    try Assert.stringContains(xml, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try Assert.stringContains(xml, "<testsuites tests=\"3\" failures=\"1\" errors=\"0\" skipped=\"1\"");
+    try Assert.stringContains(xml, "<testsuite name=\"Core Tests\"");
+    try Assert.stringContains(xml, "<testcase name=\"test_passing\"");
+    try Assert.stringContains(xml, "<testcase name=\"test_failing\"");
+    try Assert.stringContains(xml, "<testcase name=\"test_skipped\"");
+    try Assert.stringContains(xml, "<failure");
+    try Assert.stringContains(xml, "<skipped");
+    try Assert.stringContains(xml, "Expected 42 but got 24");
+    try Assert.stringContains(xml, "</testsuites>");
+}
+
+test "JUnit XML escaping and special characters" {
+    var suite = TestSuite.init(std.testing.allocator, "Special Characters & Tests <\"'>", "Tests with special XML characters");
+    defer suite.deinit();
+
+    const test_with_special_chars = TestCase{
+        .name = "test_with_<>&\"'_chars",
+        .category = .unit,
+        .priority = .high,
+        .description = "Test with special characters",
+        .result = .fail,
+        .error_message = "Error with <tags> & \"quotes\" and 'apostrophes'",
+        .start_time = 1000000000,
+        .end_time = 1001000000,
+    };
+
+    try suite.addTest(test_with_special_chars);
+
+    var summary = TestSummary.init(std.testing.allocator);
+    defer summary.deinit();
+    try summary.addSuite(&suite);
+
+    var buffer = std.ArrayList(u8).init(std.testing.allocator);
+    defer buffer.deinit();
+
+    try summary.writeJUnitToWriter(buffer.writer());
+    const xml = buffer.items;
+
+    // Verify special characters are properly escaped
+    try Assert.stringContains(xml, "&lt;tags&gt;");
+    try Assert.stringContains(xml, "&amp;");
+    try Assert.stringContains(xml, "&quot;quotes&quot;");
+    try Assert.stringContains(xml, "&apos;apostrophes&apos;");
+
+    // Verify XML is well-formed (no unescaped special chars in content)
+    try Assert.isTrue(std.mem.indexOf(u8, xml, "<tags>") == null);
+    try Assert.isTrue(std.mem.indexOf(u8, xml, "& \"") == null);
+}
+
+test "JUnit XML file output" {
+    var suite = TestSuite.init(std.testing.allocator, "File Output Tests", "Testing file output functionality");
+    defer suite.deinit();
+
+    const test_case = TestCase{
+        .name = "file_output_test",
+        .category = .unit,
+        .priority = .medium,
+        .description = "Test file output",
+        .result = .pass,
+        .start_time = 1000000000,
+        .end_time = 1002000000,
+    };
+
+    try suite.addTest(test_case);
+
+    var summary = TestSummary.init(std.testing.allocator);
+    defer summary.deinit();
+    try summary.addSuite(&suite);
+
+    // Write to file
+    const test_file = "test_results.xml";
+    try summary.writeJUnitToFile(test_file);
+    defer std.fs.cwd().deleteFile(test_file) catch {};
+
+    // Read file and verify content
+    const file = try std.fs.cwd().openFile(test_file, .{});
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const content = try std.testing.allocator.alloc(u8, file_size);
+    defer std.testing.allocator.free(content);
+
+    _ = try file.readAll(content);
+
+    try Assert.stringContains(content, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    try Assert.stringContains(content, "<testsuite name=\"File Output Tests\"");
+    try Assert.stringContains(content, "<testcase name=\"file_output_test\"");
+}
+
+test "JUnit XML timeout and error handling" {
+    var suite = TestSuite.init(std.testing.allocator, "Error Tests", "Testing error and timeout scenarios");
+    defer suite.deinit();
+
+    const timeout_test = TestCase{
+        .name = "timeout_test",
+        .category = .performance,
+        .priority = .high,
+        .description = "Test that times out",
+        .result = .timeout,
+        .timeout_ms = 5000,
+        .start_time = 1000000000,
+        .end_time = 1006000000000, // 6 seconds (exceeds timeout)
+    };
+
+    const error_test = TestCase{
+        .name = "error_test",
+        .category = .unit,
+        .priority = .critical,
+        .description = "Test with error",
+        .result = .@"error",
+        .error_message = "Unexpected system error occurred",
+        .start_time = 2000000000,
+        .end_time = 2001000000,
+    };
+
+    try suite.addTest(timeout_test);
+    try suite.addTest(error_test);
+
+    var summary = TestSummary.init(std.testing.allocator);
+    defer summary.deinit();
+    try summary.addSuite(&suite);
+
+    var buffer = std.ArrayList(u8).init(std.testing.allocator);
+    defer buffer.deinit();
+
+    try summary.writeJUnitToWriter(buffer.writer());
+    const xml = buffer.items;
+
+    // Verify timeout is treated as error
+    try Assert.stringContains(xml, "errors=\"2\"");
+    try Assert.stringContains(xml, "TimeoutError");
+    try Assert.stringContains(xml, "Test timed out after 5000ms");
+    try Assert.stringContains(xml, "TestError");
+    try Assert.stringContains(xml, "Unexpected system error occurred");
+}
+
+test "JUnit XML empty test suite" {
+    var suite = TestSuite.init(std.testing.allocator, "Empty Suite", "Suite with no tests");
+    defer suite.deinit();
+
+    var summary = TestSummary.init(std.testing.allocator);
+    defer summary.deinit();
+    try summary.addSuite(&suite);
+
+    var buffer = std.ArrayList(u8).init(std.testing.allocator);
+    defer buffer.deinit();
+
+    try summary.writeJUnitToWriter(buffer.writer());
+    const xml = buffer.items;
+
+    // Verify empty suite is handled correctly
+    try Assert.stringContains(xml, "tests=\"0\"");
+    try Assert.stringContains(xml, "failures=\"0\"");
+    try Assert.stringContains(xml, "errors=\"0\"");
+    try Assert.stringContains(xml, "<testsuite name=\"Empty Suite\" tests=\"0\"");
+}
+
+test "JUnit XML multiple test suites" {
+    var suite1 = TestSuite.init(std.testing.allocator, "Suite One", "First test suite");
+    defer suite1.deinit();
+
+    var suite2 = TestSuite.init(std.testing.allocator, "Suite Two", "Second test suite");
+    defer suite2.deinit();
+
+    // Add tests to first suite
+    const test1 = TestCase{
+        .name = "suite1_test1",
+        .category = .unit,
+        .priority = .high,
+        .description = "First test",
+        .result = .pass,
+        .start_time = 1000000000,
+        .end_time = 1001000000,
+    };
+    try suite1.addTest(test1);
+
+    // Add tests to second suite
+    const test2 = TestCase{
+        .name = "suite2_test1",
+        .category = .integration,
+        .priority = .medium,
+        .description = "Second test",
+        .result = .fail,
+        .error_message = "Integration test failed",
+        .start_time = 2000000000,
+        .end_time = 2002000000,
+    };
+    try suite2.addTest(test2);
+
+    var summary = TestSummary.init(std.testing.allocator);
+    defer summary.deinit();
+    try summary.addSuite(&suite1);
+    try summary.addSuite(&suite2);
+
+    var buffer = std.ArrayList(u8).init(std.testing.allocator);
+    defer buffer.deinit();
+
+    try summary.writeJUnitToWriter(buffer.writer());
+    const xml = buffer.items;
+
+    // Verify both suites are present
+    try Assert.stringContains(xml, "<testsuite name=\"Suite One\"");
+    try Assert.stringContains(xml, "<testsuite name=\"Suite Two\"");
+    try Assert.stringContains(xml, "suite1_test1");
+    try Assert.stringContains(xml, "suite2_test1");
+    try Assert.stringContains(xml, "tests=\"2\""); // Total tests across all suites
+    try Assert.stringContains(xml, "failures=\"1\""); // One failure total
 }

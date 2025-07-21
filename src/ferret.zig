@@ -1,7 +1,7 @@
 //! Ferret: A high-performance web framework for Zig
 //!
-//! Ferret is inspired by facil.io and designed to provide fast, memory-safe
-//! networking and web application capabilities in Zig.
+//! Ferret is designed to provide fast, memory-safe networking and
+//! web application capabilities in Zig.
 
 const std = @import("std");
 
