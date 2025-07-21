@@ -1491,7 +1491,6 @@ test "HTTP server request handler" {
 /// Parse HTTP headers from raw request data
 /// Handles header folding, case-insensitive names, and proper value trimming
 fn parseHttpHeaders(allocator: Allocator, request: *Request, data: []const u8) !void {
-    _ = allocator; // Parameter reserved for future use (header folding, etc.)
     // Find the start of headers (after the request line)
     const request_line_end = std.mem.indexOf(u8, data, "\r\n") orelse return HttpServerError.InvalidRequest;
     var pos = request_line_end + 2; // Skip past "\r\n"
@@ -1506,10 +1505,8 @@ fn parseHttpHeaders(allocator: Allocator, request: *Request, data: []const u8) !
         const line_end = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse break;
         const line = data[pos..line_end];
 
-        // Handle header folding (lines starting with space or tab are continuations)
+        // Skip folded header continuation lines (they're handled by buildCompleteHeaderValue)
         if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
-            // This is a folded header continuation - for now, skip it
-            // TODO: Implement proper header folding support
             pos = line_end + 2;
             continue;
         }
@@ -1530,26 +1527,139 @@ fn parseHttpHeaders(allocator: Allocator, request: *Request, data: []const u8) !
         const header_name = line[0..colon_pos];
         const header_value_start = colon_pos + 1;
 
-        // Extract and trim header value
-        var header_value = if (header_value_start < line.len)
-            line[header_value_start..]
-        else
-            "";
-
-        // Trim leading and trailing whitespace from value
-        header_value = std.mem.trim(u8, header_value, " \t");
-
-        // Validate header name (RFC 7230: token characters only)
+        // Validate header name first (RFC 7230: token characters only)
         if (!isValidHeaderName(header_name)) {
             pos = line_end + 2;
             continue;
         }
 
-        // Store the header (Headers.set handles case-insensitive storage)
-        try request.setHeader(header_name, header_value);
+        // Extract and build complete header value (including folded lines)
+        // This function will update pos to skip any consumed continuation lines
+        const complete_header_value = try buildCompleteHeaderValue(allocator, data, header_value_start, line_end, &pos);
+        defer if (complete_header_value.needs_free) allocator.free(complete_header_value.value);
 
-        pos = line_end + 2;
+        // Store the header (Headers.set handles case-insensitive storage)
+        try request.setHeader(header_name, complete_header_value.value);
     }
+}
+
+/// Result of building a complete header value (may include folded content)
+const HeaderValueResult = struct {
+    value: []const u8,
+    needs_free: bool,
+};
+
+/// Build complete header value including RFC 7230 header folding support
+/// According to RFC 7230: header values can span multiple lines when continuation
+/// lines start with SP or HTAB. Folding is unfolded by replacing CRLF 1*(SP/HTAB) with SP.
+fn buildCompleteHeaderValue(
+    allocator: Allocator,
+    data: []const u8,
+    value_start: usize,
+    first_line_end: usize,
+    pos: *usize,
+) !HeaderValueResult {
+    // Extract initial header value from first line
+    const first_line_start = pos.*;
+    const first_line = data[first_line_start..first_line_end];
+
+    var initial_value = if (value_start < first_line.len)
+        first_line[value_start..]
+    else
+        "";
+
+    // Trim leading and trailing whitespace from initial value
+    initial_value = std.mem.trim(u8, initial_value, " \t");
+
+    // Look ahead to check if there are continuation lines
+    var lookahead_pos = first_line_end + 2; // Move past current line's CRLF
+    var has_folding = false;
+
+    // Scan for folded lines
+    while (lookahead_pos < data.len) {
+        // Check for end of headers
+        if (lookahead_pos + 1 < data.len and data[lookahead_pos] == '\r' and data[lookahead_pos + 1] == '\n') {
+            break; // End of headers section
+        }
+
+        // Find end of this potential continuation line
+        const continuation_line_end = std.mem.indexOfPos(u8, data, lookahead_pos, "\r\n") orelse break;
+        const continuation_line = data[lookahead_pos..continuation_line_end];
+
+        // Check if this is a folded continuation line
+        if (continuation_line.len > 0 and (continuation_line[0] == ' ' or continuation_line[0] == '\t')) {
+            has_folding = true;
+            lookahead_pos = continuation_line_end + 2; // Move to next line
+        } else {
+            break; // Not a continuation line
+        }
+    }
+
+    // If no folding, return the simple trimmed value
+    if (!has_folding) {
+        pos.* = first_line_end + 2; // Move past current line's CRLF
+        return HeaderValueResult{
+            .value = initial_value,
+            .needs_free = false,
+        };
+    }
+
+    // Build folded header value according to RFC 7230
+    var folded_value = std.ArrayList(u8).init(allocator);
+    defer folded_value.deinit();
+
+    // Add initial value
+    try folded_value.appendSlice(initial_value);
+
+    // Process continuation lines
+    var current_pos = first_line_end + 2; // Start after first line's CRLF
+    while (current_pos < data.len) {
+        // Check for end of headers
+        if (current_pos + 1 < data.len and data[current_pos] == '\r' and data[current_pos + 1] == '\n') {
+            break;
+        }
+
+        // Find end of this line
+        const line_end = std.mem.indexOfPos(u8, data, current_pos, "\r\n") orelse break;
+        const line = data[current_pos..line_end];
+
+        // Check if this is a continuation line
+        if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
+            // This is a folded continuation line
+            // RFC 7230: Replace CRLF 1*(SP/HTAB) with single SP
+            try folded_value.append(' ');
+
+            // Add the continuation content, trimming leading whitespace
+            const continuation_content = std.mem.trimLeft(u8, line, " \t");
+            try folded_value.appendSlice(continuation_content);
+
+            current_pos = line_end + 2; // Move to next line
+        } else {
+            break; // Not a continuation line, stop processing
+        }
+    }
+
+    // Update position to after all processed lines
+    pos.* = current_pos;
+
+    // Return allocated folded value (caller must free)
+    const final_value = try folded_value.toOwnedSlice();
+    const trimmed_value = std.mem.trim(u8, final_value, " \t");
+
+    // If trimming removed characters, we need to create a new allocation
+    if (trimmed_value.len != final_value.len) {
+        const trimmed_copy = try allocator.dupe(u8, trimmed_value);
+        allocator.free(final_value); // Free the original allocation
+        return HeaderValueResult{
+            .value = trimmed_copy,
+            .needs_free = true,
+        };
+    }
+
+    return HeaderValueResult{
+        .value = final_value,
+        .needs_free = true,
+    };
 }
 
 /// Validate header name according to RFC 7230 token rules
@@ -1628,6 +1738,61 @@ test "HTTP header parsing edge cases" {
     try testing.expect(request.headers.get("") == null); // Empty name header
     try testing.expect(request.headers.get("No-Colon-Header") == null);
     try testing.expect(request.headers.get("Invalid@Char") == null);
+}
+
+test "HTTP header folding support" {
+    // Test RFC 7230 header folding with continuation lines
+    const test_request =
+        "GET /api/data HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Long-Header: this is a very long header value\r\n" ++
+        " that continues on the next line\r\n" ++
+        "\t and also continues with a tab prefix\r\n" ++
+        "Another-Header: simple value\r\n" ++
+        "Multi-Fold: start\r\n" ++
+        "  second line\r\n" ++
+        "   third line with more spaces\r\n" ++
+        "\tfourth line with tab\r\n" ++
+        "Normal-Header: normal value\r\n" ++
+        "\r\n";
+
+    var request = Request.init(testing.allocator, .GET, "/api/data");
+    defer request.deinit();
+
+    try parseHttpHeaders(testing.allocator, &request, test_request);
+
+    // Test that folded headers were correctly unfolded
+    try testing.expectEqualStrings("example.com", request.headers.get("Host").?);
+    try testing.expectEqualStrings("this is a very long header value that continues on the next line and also continues with a tab prefix", request.headers.get("Long-Header").?);
+    try testing.expectEqualStrings("simple value", request.headers.get("Another-Header").?);
+    try testing.expectEqualStrings("start second line third line with more spaces fourth line with tab", request.headers.get("Multi-Fold").?);
+    try testing.expectEqualStrings("normal value", request.headers.get("Normal-Header").?);
+}
+
+test "HTTP header folding edge cases" {
+    // Test edge cases for header folding
+    const test_request =
+        "GET / HTTP/1.1\r\n" ++
+        "Empty-Fold: value\r\n" ++
+        " \r\n" ++ // Continuation line with only whitespace
+        "Whitespace-Only:\r\n" ++
+        "  \t  \r\n" ++ // Header with only whitespace in continuation
+        "Mixed-Whitespace: start\r\n" ++
+        " \t mixed whitespace prefix\r\n" ++
+        "Trailing-Space: value with trailing space \r\n" ++
+        "  continuation\r\n" ++
+        "\r\n";
+
+    var request = Request.init(testing.allocator, .GET, "/");
+    defer request.deinit();
+
+    try parseHttpHeaders(testing.allocator, &request, test_request);
+
+    // Test edge case handling
+    try testing.expectEqualStrings("value", request.headers.get("Empty-Fold").?);
+    try testing.expectEqualStrings("", request.headers.get("Whitespace-Only").?);
+    try testing.expectEqualStrings("start mixed whitespace prefix", request.headers.get("Mixed-Whitespace").?);
+    try testing.expectEqualStrings("value with trailing space continuation", request.headers.get("Trailing-Space").?);
 }
 
 test "HTTP server error handling" {
