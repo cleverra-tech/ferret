@@ -58,13 +58,6 @@ pub const cipher = @import("crypto/cipher.zig");
 pub const rand = @import("crypto/rand.zig");
 pub const asymmetric = @import("crypto/asymmetric.zig");
 
-// CLI utilities
-pub const Cli = @import("cli/args.zig").Cli;
-pub const CliConfig = @import("cli/args.zig").CliConfig;
-pub const CliError = @import("cli/args.zig").CliError;
-pub const ParseResult = @import("cli/args.zig").ParseResult;
-pub const ArgValue = @import("cli/args.zig").ArgValue;
-
 // Testing framework
 pub const testing = @import("testing/framework.zig");
 

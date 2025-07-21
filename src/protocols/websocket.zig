@@ -14,6 +14,7 @@ const mem = std.mem;
 const testing = std.testing;
 const crypto = std.crypto;
 const Allocator = mem.Allocator;
+const ArrayList = std.ArrayList;
 
 /// WebSocket handshake magic key for SHA-1 hash
 const WEBSOCKET_MAGIC_KEY = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -55,6 +56,138 @@ pub const CloseCode = enum(u16) {
     bad_gateway = 1014,
     tls_handshake = 1015,
     _,
+};
+
+/// WebSocket per-message deflate compression implementation (RFC 7692)
+pub const CompressionContext = struct {
+    enabled: bool,
+    server_max_window_bits: u4,
+    client_max_window_bits: u4,
+    server_no_context_takeover: bool,
+    client_no_context_takeover: bool,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .enabled = false,
+            .server_max_window_bits = 15,
+            .client_max_window_bits = 15,
+            .server_no_context_takeover = false,
+            .client_no_context_takeover = false,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        _ = self;
+    }
+
+    /// Enable compression with specified parameters
+    pub fn enable(self: *Self, server_max_window_bits: u4, client_max_window_bits: u4, server_no_context_takeover: bool, client_no_context_takeover: bool) !void {
+        self.enabled = true;
+        self.server_max_window_bits = server_max_window_bits;
+        self.client_max_window_bits = client_max_window_bits;
+        self.server_no_context_takeover = server_no_context_takeover;
+        self.client_no_context_takeover = client_no_context_takeover;
+    }
+
+    /// Compress payload data using permessage-deflate
+    pub fn compress(self: *Self, data: []const u8) ![]const u8 {
+        if (!self.enabled) return data;
+
+        var compressed_buf = ArrayList(u8).init(self.allocator);
+        defer compressed_buf.deinit();
+
+        // Use flate compress function for raw deflate data
+        var input_stream = std.io.fixedBufferStream(data);
+        try std.compress.flate.compress(input_stream.reader(), compressed_buf.writer(), .{ .level = .default });
+
+        // Remove the trailing 0x00 0x00 0xFF 0xFF bytes as per RFC 7692
+        var compressed = compressed_buf.items;
+        if (compressed.len >= 4) {
+            const tail = compressed[compressed.len - 4 ..];
+            if (mem.eql(u8, tail, &[_]u8{ 0x00, 0x00, 0xFF, 0xFF })) {
+                compressed = compressed[0 .. compressed.len - 4];
+            }
+        }
+
+        return try self.allocator.dupe(u8, compressed);
+    }
+
+    /// Decompress payload data using permessage-deflate
+    pub fn decompress(self: *Self, data: []const u8) ![]const u8 {
+        if (!self.enabled) return try self.allocator.dupe(u8, data);
+
+        // Add the trailing 0x00 0x00 0xFF 0xFF bytes back for decompression
+        var decompress_data = ArrayList(u8).init(self.allocator);
+        defer decompress_data.deinit();
+
+        try decompress_data.appendSlice(data);
+        try decompress_data.appendSlice(&[_]u8{ 0x00, 0x00, 0xFF, 0xFF });
+
+        var decompressed_buf = ArrayList(u8).init(self.allocator);
+        defer decompressed_buf.deinit();
+
+        // Use flate decompress function for raw deflate data
+        var input_stream = std.io.fixedBufferStream(decompress_data.items);
+        try std.compress.flate.decompress(input_stream.reader(), decompressed_buf.writer());
+
+        return decompressed_buf.toOwnedSlice();
+    }
+
+    /// Parse permessage-deflate extension parameters
+    pub fn parseExtensionParams(self: *Self, params: []const u8) !void {
+        var iter = mem.splitSequence(u8, params, ";");
+
+        while (iter.next()) |param| {
+            const trimmed = mem.trim(u8, param, " \t");
+
+            if (mem.startsWith(u8, trimmed, "server_max_window_bits=")) {
+                const value_str = trimmed[23..];
+                const value = try std.fmt.parseInt(u4, value_str, 10);
+                if (value >= 8 and value <= 15) {
+                    self.server_max_window_bits = value;
+                }
+            } else if (mem.startsWith(u8, trimmed, "client_max_window_bits=")) {
+                const value_str = trimmed[23..];
+                const value = try std.fmt.parseInt(u4, value_str, 10);
+                if (value >= 8 and value <= 15) {
+                    self.client_max_window_bits = value;
+                }
+            } else if (mem.eql(u8, trimmed, "server_no_context_takeover")) {
+                self.server_no_context_takeover = true;
+            } else if (mem.eql(u8, trimmed, "client_no_context_takeover")) {
+                self.client_no_context_takeover = true;
+            }
+        }
+    }
+
+    /// Generate extension parameters string for handshake
+    pub fn generateExtensionParams(self: *const Self, allocator: Allocator) ![]u8 {
+        var params = ArrayList(u8).init(allocator);
+
+        try params.appendSlice("permessage-deflate");
+
+        if (self.server_max_window_bits != 15) {
+            try params.writer().print("; server_max_window_bits={}", .{self.server_max_window_bits});
+        }
+
+        if (self.client_max_window_bits != 15) {
+            try params.writer().print("; client_max_window_bits={}", .{self.client_max_window_bits});
+        }
+
+        if (self.server_no_context_takeover) {
+            try params.appendSlice("; server_no_context_takeover");
+        }
+
+        if (self.client_no_context_takeover) {
+            try params.appendSlice("; client_no_context_takeover");
+        }
+
+        return params.toOwnedSlice();
+    }
 };
 
 /// WebSocket frame header information
@@ -191,6 +324,27 @@ pub const Frame = struct {
         };
     }
 
+    /// Create compressed text frame (sets RSV1 bit)
+    pub fn compressedText(_: Allocator, data: []const u8, masked: bool, compression: *CompressionContext) !Self {
+        const compressed_data = try compression.compress(data);
+        const mask_key = if (masked) generateMaskKey() else null;
+
+        return Self{
+            .header = FrameHeader{
+                .fin = true,
+                .rsv1 = true, // Compression flag
+                .rsv2 = false,
+                .rsv3 = false,
+                .opcode = .text,
+                .masked = masked,
+                .payload_length = compressed_data.len,
+                .mask_key = mask_key,
+                .header_size = 0,
+            },
+            .payload = compressed_data,
+        };
+    }
+
     /// Create binary frame
     pub fn binary(allocator: Allocator, data: []const u8, masked: bool) !Self {
         _ = allocator;
@@ -210,6 +364,44 @@ pub const Frame = struct {
             },
             .payload = data,
         };
+    }
+
+    /// Create compressed binary frame (sets RSV1 bit)
+    pub fn compressedBinary(_: Allocator, data: []const u8, masked: bool, compression: *CompressionContext) !Self {
+        const compressed_data = try compression.compress(data);
+        const mask_key = if (masked) generateMaskKey() else null;
+
+        return Self{
+            .header = FrameHeader{
+                .fin = true,
+                .rsv1 = true, // Compression flag
+                .rsv2 = false,
+                .rsv3 = false,
+                .opcode = .binary,
+                .masked = masked,
+                .payload_length = compressed_data.len,
+                .mask_key = mask_key,
+                .header_size = 0,
+            },
+            .payload = compressed_data,
+        };
+    }
+
+    /// Decompress frame payload if compressed (RSV1 bit set)
+    pub fn decompressPayload(self: *const Self, compression: *CompressionContext) ![]u8 {
+        if (!self.header.rsv1 or !compression.enabled) {
+            // Not compressed or compression not enabled, return payload as-is
+            return try compression.allocator.dupe(u8, self.payload);
+        }
+
+        // Decompress the payload
+        const decompressed = try compression.decompress(self.payload);
+        return @constCast(decompressed);
+    }
+
+    /// Check if frame is compressed
+    pub fn isCompressed(self: *const Self) bool {
+        return self.header.rsv1;
     }
 
     /// Create close frame
@@ -843,8 +1035,20 @@ pub const UpgradeHandler = struct {
                         }
 
                         if (std.mem.eql(u8, supported, "permessage-deflate")) {
-                            // Add permessage-deflate with default parameters
-                            try selected.appendSlice("permessage-deflate; server_max_window_bits=15");
+                            // Parse permessage-deflate parameters and respond appropriately
+                            var compression_ctx = CompressionContext.init(allocator);
+                            defer compression_ctx.deinit();
+
+                            // Parse client parameters
+                            while (ext_iter.next()) |param| {
+                                const param_trimmed = std.mem.trim(u8, param, " \t");
+                                try compression_ctx.parseExtensionParams(param_trimmed);
+                            }
+
+                            // Generate response parameters
+                            const response_params = try compression_ctx.generateExtensionParams(allocator);
+                            defer allocator.free(response_params);
+                            try selected.appendSlice(response_params);
                         } else {
                             try selected.appendSlice(supported);
                         }
@@ -1282,4 +1486,159 @@ test "WebSocket message fragmentation" {
     try testing.expect(messages2.len == 1);
     try testing.expect(messages2[0].type == .text);
     try testing.expectEqualStrings(messages2[0].data, "Hello World");
+}
+
+test "WebSocket compression - permessage-deflate initialization" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    try testing.expect(!compression.enabled);
+    try testing.expect(compression.server_max_window_bits == 15);
+    try testing.expect(compression.client_max_window_bits == 15);
+    try testing.expect(!compression.server_no_context_takeover);
+    try testing.expect(!compression.client_no_context_takeover);
+}
+
+test "WebSocket compression - parameter parsing" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    try compression.parseExtensionParams("server_max_window_bits=12; client_no_context_takeover");
+
+    try testing.expect(compression.server_max_window_bits == 12);
+    try testing.expect(compression.client_max_window_bits == 15); // Default
+    try testing.expect(!compression.server_no_context_takeover);
+    try testing.expect(compression.client_no_context_takeover);
+}
+
+test "WebSocket compression - extension parameter generation" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    compression.server_max_window_bits = 12;
+    compression.client_no_context_takeover = true;
+
+    const params = try compression.generateExtensionParams(testing.allocator);
+    defer testing.allocator.free(params);
+
+    try testing.expect(std.mem.indexOf(u8, params, "permessage-deflate") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "server_max_window_bits=12") != null);
+    try testing.expect(std.mem.indexOf(u8, params, "client_no_context_takeover") != null);
+}
+
+test "WebSocket compression - compress and decompress cycle" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    try compression.enable(15, 15, false, false);
+
+    const original_data = "Hello, World! This is a test message that should compress well because it has repeating patterns and common words.";
+
+    // Compress data
+    const compressed = try compression.compress(original_data);
+    defer testing.allocator.free(compressed);
+    try testing.expect(compressed.len < original_data.len); // Should be smaller
+
+    // Decompress data
+    const decompressed = try compression.decompress(compressed);
+    defer testing.allocator.free(decompressed);
+
+    try testing.expectEqualStrings(original_data, decompressed);
+}
+
+test "WebSocket compression - compressed text frame creation" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    try compression.enable(15, 15, false, false);
+
+    const original_data = "This is a test message for compression.";
+    const frame = try Frame.compressedText(testing.allocator, original_data, false, &compression);
+    defer testing.allocator.free(frame.payload);
+
+    try testing.expect(frame.header.opcode == .text);
+    try testing.expect(frame.header.fin == true);
+    try testing.expect(frame.header.rsv1 == true); // Compression flag set
+    try testing.expect(frame.header.masked == false);
+    try testing.expect(frame.isCompressed());
+
+    // Verify we can decompress the payload
+    const decompressed = try frame.decompressPayload(&compression);
+    defer testing.allocator.free(decompressed);
+    try testing.expectEqualStrings(original_data, decompressed);
+}
+
+test "WebSocket compression - compressed binary frame creation" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    try compression.enable(15, 15, false, false);
+
+    const original_data = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05 } ** 20; // Repeating pattern
+    const frame = try Frame.compressedBinary(testing.allocator, &original_data, false, &compression);
+    defer testing.allocator.free(frame.payload);
+
+    try testing.expect(frame.header.opcode == .binary);
+    try testing.expect(frame.header.rsv1 == true); // Compression flag set
+    try testing.expect(frame.isCompressed());
+
+    // Verify compression worked (payload should be smaller)
+    try testing.expect(frame.payload.len < original_data.len);
+}
+
+test "WebSocket compression - frame decompression when not compressed" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    try compression.enable(15, 15, false, false);
+
+    const original_data = "Uncompressed message";
+    var frame = try Frame.text(testing.allocator, original_data, false);
+
+    try testing.expect(!frame.isCompressed()); // RSV1 should be false
+
+    // Decompressing uncompressed frame should return original data
+    const result = try frame.decompressPayload(&compression);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings(original_data, result);
+}
+
+test "WebSocket compression - performance benchmark" {
+    var compression = CompressionContext.init(testing.allocator);
+    defer compression.deinit();
+
+    try compression.enable(15, 15, false, false);
+
+    // Large test data that should compress well
+    const large_data = "The quick brown fox jumps over the lazy dog. " ** 100;
+
+    const iterations = 1000;
+    const start = std.time.nanoTimestamp();
+
+    var total_original: usize = 0;
+    var total_compressed: usize = 0;
+
+    for (0..iterations) |_| {
+        const compressed = try compression.compress(large_data);
+        defer testing.allocator.free(compressed);
+        total_original += large_data.len;
+        total_compressed += compressed.len;
+
+        // Verify decompression
+        const decompressed = try compression.decompress(compressed);
+        defer testing.allocator.free(decompressed);
+        try testing.expectEqualStrings(large_data, decompressed);
+    }
+
+    const end = std.time.nanoTimestamp();
+    const duration_ns = end - start;
+    const compression_ratio = @as(f64, @floatFromInt(total_compressed)) / @as(f64, @floatFromInt(total_original));
+
+    std.debug.print("\nWebSocket Compression Performance:\n", .{});
+    std.debug.print("  Iterations: {}\n", .{iterations});
+    std.debug.print("  Total time: {d:.2} ms\n", .{@as(f64, @floatFromInt(duration_ns)) / 1_000_000.0});
+    std.debug.print("  Per operation: {d:.2} μs\n", .{@as(f64, @floatFromInt(duration_ns)) / @as(f64, @floatFromInt(iterations)) / 1000.0});
+    std.debug.print("  Compression ratio: {d:.1}% ({} -> {} bytes avg)\n", .{ compression_ratio * 100.0, total_original / iterations, total_compressed / iterations });
+
+    try testing.expect(compression_ratio < 0.5); // Should achieve >50% compression
 }

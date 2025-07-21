@@ -1,15 +1,6 @@
 const std = @import("std");
 const ferret = @import("ferret");
 
-const Args = struct {
-    verbose: ?bool = null,
-    port: ?u16 = null,
-    host: ?[]const u8 = null,
-    config: ?[]const u8 = null,
-    workers: ?u32 = null,
-    help: ?bool = null,
-};
-
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -18,52 +9,44 @@ pub fn main() !void {
     const version_str = try ferret.versionString(allocator);
     defer allocator.free(version_str);
 
-    // Parse command line arguments
-    var cli = try ferret.Cli(Args).init(allocator, ferret.CliConfig{
-        .program_name = "ferret",
-        .version = version_str,
-        .description = "High-performance web framework for Zig",
-        .author = "Ferret Contributors",
-        .after_help = "For more information, visit: https://github.com/cleverra-tech/ferret",
-    });
-    defer cli.deinit();
+    std.log.info("Ferret v{s} - High-performance web framework for Zig", .{version_str});
 
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+    // Demo the framework's core features
+    try demoDataStructures(allocator);
+    try demoHttp();
 
-    var result = cli.parse(argv) catch |err| switch (err) {
-        ferret.CliError.HelpRequested, ferret.CliError.VersionRequested => return,
-        else => return err,
-    };
-    defer result.deinit();
+    std.log.info("Framework demo complete", .{});
+}
 
-    // Configure logging level
-    if (result.getBool("verbose")) {
-        std.log.info("Verbose logging enabled", .{});
-    }
+fn demoDataStructures(allocator: std.mem.Allocator) !void {
+    std.log.info("=== Data Structures Demo ===", .{});
 
-    std.log.info("Ferret v{s} starting...", .{version_str});
-
-    // Display configuration
-    const port = result.getUint("port") orelse 8080;
-    const host = result.getString("host") orelse "localhost";
-    const workers = result.getUint("workers") orelse 4;
-
-    std.log.info("Configuration:", .{});
-    std.log.info("  Host: {s}", .{host});
-    std.log.info("  Port: {}", .{port});
-    std.log.info("  Workers: {}", .{workers});
-
-    if (result.getString("config")) |config_file| {
-        std.log.info("  Config file: {s}", .{config_file});
-    }
-
-    // Example usage
+    // String demo
     var string = ferret.String.init(allocator);
     defer string.deinit();
-
     try string.appendSlice("Hello, Ferret!");
-    std.log.info("Created string: {s}", .{string.slice()});
+    std.log.info("String: {s}", .{string.slice()});
 
-    std.log.info("Server would start here (not implemented yet)", .{});
+    // Array demo
+    var numbers = ferret.Array(i32).init(allocator);
+    defer numbers.deinit();
+    try numbers.append(42);
+    try numbers.append(84);
+    std.log.info("Array length: {}, first: {}", .{ numbers.len(), numbers.first().? });
+
+    // HashMap demo
+    var map = ferret.HashMap([]const u8, u32).init(allocator);
+    defer map.deinit();
+    try map.put("answer", 42);
+    std.log.info("HashMap value: {}", .{map.get("answer").?});
+}
+
+fn demoHttp() !void {
+    std.log.info("=== HTTP Protocols Demo ===", .{});
+
+    std.log.info("Supported protocols:", .{});
+    std.log.info("  HTTP/1.1: Basic web serving", .{});
+    std.log.info("  HTTP/2: Multiplexing and server push", .{});
+    std.log.info("  HTTP/3: QUIC transport with reduced latency", .{});
+    std.log.info("  WebSocket: Real-time bidirectional communication", .{});
 }

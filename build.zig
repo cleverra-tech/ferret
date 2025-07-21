@@ -334,24 +334,6 @@ pub fn build(b: *std.Build) void {
     const atomic_benchmark_step = b.step("benchmark-atomic", "Run Atomic operations performance benchmark");
     atomic_benchmark_step.dependOn(&run_atomic_benchmark.step);
 
-    // CLI benchmark
-    const cli_benchmark = b.addExecutable(.{
-        .name = "cli_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/cli_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(cli_benchmark);
-
-    const run_cli_benchmark = b.addRunArtifact(cli_benchmark);
-    const cli_benchmark_step = b.step("benchmark-cli", "Run CLI parsing performance benchmark");
-    cli_benchmark_step.dependOn(&run_cli_benchmark.step);
-
     // Configuration benchmark
     const config_benchmark = b.addExecutable(.{
         .name = "config_benchmark",
@@ -406,6 +388,60 @@ pub fn build(b: *std.Build) void {
     const asymmetric_crypto_benchmark_step = b.step("benchmark-asymmetric-crypto", "Run asymmetric cryptography performance benchmark");
     asymmetric_crypto_benchmark_step.dependOn(&run_asymmetric_crypto_benchmark.step);
 
+    // Data structures demo
+    const data_structures_demo = b.addExecutable(.{
+        .name = "data_structures_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/data_structures_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(data_structures_demo);
+
+    const run_data_structures_demo = b.addRunArtifact(data_structures_demo);
+    const data_structures_demo_step = b.step("demo-data-structures", "Run data structures demo");
+    data_structures_demo_step.dependOn(&run_data_structures_demo.step);
+
+    // HTTP/3 benchmark
+    const http3_benchmark = b.addExecutable(.{
+        .name = "http3_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/http3_benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(http3_benchmark);
+
+    const run_http3_benchmark = b.addRunArtifact(http3_benchmark);
+    const http3_benchmark_step = b.step("benchmark-http3", "Run HTTP/3 performance benchmark");
+    http3_benchmark_step.dependOn(&run_http3_benchmark.step);
+
+    // Simple HTTP/3 demo
+    const simple_http3_demo = b.addExecutable(.{
+        .name = "simple_http3_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/simple_http3_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ferret", .module = ferret_mod },
+            },
+        }),
+    });
+    b.installArtifact(simple_http3_demo);
+
+    const run_simple_http3_demo = b.addRunArtifact(simple_http3_demo);
+    const simple_http3_demo_step = b.step("demo-simple-http3", "Run simple HTTP/3 demo");
+    simple_http3_demo_step.dependOn(&run_simple_http3_demo.step);
+
     // HTTP client test
     const http_client_test = b.addExecutable(.{
         .name = "http_client_test",
@@ -451,8 +487,8 @@ pub fn build(b: *std.Build) void {
     benchmark_step.dependOn(&run_buffer_benchmark.step);
     benchmark_step.dependOn(&run_socket_benchmark.step);
     benchmark_step.dependOn(&run_atomic_benchmark.step);
-    benchmark_step.dependOn(&run_cli_benchmark.step);
     benchmark_step.dependOn(&run_config_benchmark.step);
     benchmark_step.dependOn(&run_websocket_benchmark.step);
     benchmark_step.dependOn(&run_asymmetric_crypto_benchmark.step);
+    benchmark_step.dependOn(&run_http3_benchmark.step);
 }

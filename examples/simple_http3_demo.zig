@@ -17,7 +17,7 @@ pub fn main() !void {
 
     // Demo variable-length integer encoding/decoding
     try demoVarintOperations(allocator);
-    
+
     // Demo frame operations
     try demoFrameOperations(allocator);
 
@@ -29,11 +29,11 @@ fn demoVarintOperations(allocator: std.mem.Allocator) !void {
     print("   ==================================\n", .{});
 
     const test_values = [_]u64{ 42, 16383, 1073741823 };
-    
+
     for (test_values) |value| {
         var buffer = std.ArrayList(u8).init(allocator);
         defer buffer.deinit();
-        
+
         // Simple varint encoding for demo
         if (value < 64) {
             try buffer.append(@intCast(value));
@@ -46,7 +46,7 @@ fn demoVarintOperations(allocator: std.mem.Allocator) !void {
             try buffer.append(@intCast((value >> 8) & 0xFF));
             try buffer.append(@intCast(value & 0xFF));
         }
-        
+
         print("   Value {d} encoded to {} bytes\n", .{ value, buffer.items.len });
     }
     print("\n", .{});
@@ -57,21 +57,21 @@ fn demoFrameOperations(allocator: std.mem.Allocator) !void {
     print("   ==================\n", .{});
 
     const test_data = "Hello, HTTP/3!";
-    
+
     // Simulate creating a DATA frame
     var frame_buffer = std.ArrayList(u8).init(allocator);
     defer frame_buffer.deinit();
-    
+
     // Frame type (DATA = 0)
     try frame_buffer.append(0);
     // Frame length
     try frame_buffer.append(@intCast(test_data.len));
     // Frame payload
     try frame_buffer.appendSlice(test_data);
-    
+
     print("   Created DATA frame with {} bytes payload\n", .{test_data.len});
     print("   Total frame size: {} bytes\n", .{frame_buffer.items.len});
     print("   Frame content: \"{s}\"\n", .{test_data});
-    
+
     print("\n", .{});
 }

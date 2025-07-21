@@ -8,7 +8,8 @@
 //! - Connection establishment simulation
 
 const std = @import("std");
-const http3 = @import("../src/protocols/http3.zig");
+const ferret = @import("ferret");
+const http3 = ferret.Http3;
 const testing = std.testing;
 const print = std.debug.print;
 
@@ -24,13 +25,13 @@ pub fn main() !void {
 
     // 1. QUIC Varint Encoding/Decoding
     try benchmarkVarintOperations();
-    
+
     // 2. HTTP/3 Frame Operations
     try benchmarkFrameOperations(allocator);
-    
+
     // 3. QPACK Header Compression
     try benchmarkQpackOperations(allocator);
-    
+
     // 4. QUIC Connection Operations
     try benchmarkConnectionOperations(allocator);
 
@@ -43,7 +44,7 @@ fn benchmarkVarintOperations() !void {
 
     // Test values covering different varint lengths
     const test_values = [_]u64{ 42, 16383, 1073741823, 4611686018427387903 };
-    
+
     // Encoding benchmark
     {
         var buffer = std.ArrayList(u8).init(std.heap.page_allocator);

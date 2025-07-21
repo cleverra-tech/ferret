@@ -16,7 +16,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    std.log.info("=== Ferret Data Structures Demo ===");
+    std.log.info("=== Ferret Data Structures Demo ===", .{});
 
     // Array demonstration
     try demonstrateArray(allocator);
@@ -27,11 +27,11 @@ pub fn main() !void {
     // String demonstration
     try demonstrateString(allocator);
 
-    std.log.info("=== Demo completed successfully! ===");
+    std.log.info("=== Demo completed successfully! ===", .{});
 }
 
 fn demonstrateArray(allocator: std.mem.Allocator) !void {
-    std.log.info("\n--- Array Demo ---");
+    std.log.info("\n--- Array Demo ---", .{});
 
     var numbers = Array(i32).init(allocator);
     defer numbers.deinit();
@@ -47,7 +47,7 @@ fn demonstrateArray(allocator: std.mem.Allocator) !void {
 
     // Insert in the middle
     try numbers.insert(1, 15);
-    std.log.info("After inserting 15 at index 1:");
+    std.log.info("After inserting 15 at index 1:", .{});
     for (numbers.slice(), 0..) |num, i| {
         std.log.info("  [{}]: {}", .{ i, num });
     }
@@ -59,14 +59,14 @@ fn demonstrateArray(allocator: std.mem.Allocator) !void {
         }
     }.lessThan);
 
-    std.log.info("After sorting:");
+    std.log.info("After sorting:", .{});
     for (numbers.slice(), 0..) |num, i| {
         std.log.info("  [{}]: {}", .{ i, num });
     }
 }
 
 fn demonstrateHashMap(allocator: std.mem.Allocator) !void {
-    std.log.info("\n--- HashMap Demo ---");
+    std.log.info("\n--- HashMap Demo ---", .{});
 
     var ages = HashMap([]const u8, u32).init(allocator);
     defer ages.deinit();
@@ -86,11 +86,11 @@ fn demonstrateHashMap(allocator: std.mem.Allocator) !void {
     if (ages.get("David")) |age| {
         std.log.info("David is {} years old", .{age});
     } else {
-        std.log.info("David not found in the map");
+        std.log.info("David not found in the map", .{});
     }
 
     // Iterate over all entries
-    std.log.info("All entries:");
+    std.log.info("All entries:", .{});
     var iter = ages.iterator();
     while (iter.next()) |entry| {
         std.log.info("  {s}: {}", .{ entry.key, entry.value });
@@ -102,7 +102,7 @@ fn demonstrateHashMap(allocator: std.mem.Allocator) !void {
 }
 
 fn demonstrateString(allocator: std.mem.Allocator) !void {
-    std.log.info("\n--- String Demo ---");
+    std.log.info("\n--- String Demo ---", .{});
 
     var message = String.init(allocator);
     defer message.deinit();
