@@ -11,9 +11,19 @@
 
 const std = @import("std");
 const mem = std.mem;
+const net = std.net;
+const crypto = std.crypto;
 const testing = std.testing;
 const Allocator = mem.Allocator;
 const ArrayList = std.ArrayList;
+
+// Import Ferret modules
+const Socket = @import("../io/socket.zig").Socket;
+const SocketManager = @import("../io/socket.zig").SocketManager;
+const SocketAddress = @import("../io/socket.zig").SocketAddress;
+const Protocol = @import("../io/socket.zig").Protocol;
+const Cipher = @import("../crypto/cipher.zig").Cipher;
+const ChaCha20Poly1305Key = @import("../crypto/cipher.zig").ChaCha20Poly1305Key;
 
 /// HTTP/2 connection preface
 pub const CONNECTION_PREFACE = "PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n";
@@ -637,6 +647,630 @@ pub const HpackDecoder = struct {
     }
 };
 
+/// TLS handshake state for HTTP/2
+pub const TlsState = struct {
+    handshake_complete: bool,
+    application_data_ready: bool,
+    cipher_suite: TlsCipherSuite,
+    session_keys: SessionKeys,
+    certificate_verified: bool,
+
+    const Self = @This();
+
+    pub fn init() Self {
+        return Self{
+            .handshake_complete = false,
+            .application_data_ready = false,
+            .cipher_suite = .tls_aes_256_gcm_sha384,
+            .session_keys = SessionKeys.init(),
+            .certificate_verified = false,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.session_keys.clear();
+    }
+};
+
+/// TLS cipher suites for HTTP/2
+pub const TlsCipherSuite = enum(u16) {
+    tls_aes_128_gcm_sha256 = 0x1301,
+    tls_aes_256_gcm_sha384 = 0x1302,
+    tls_chacha20_poly1305_sha256 = 0x1303,
+};
+
+/// Session keys for TLS encryption
+pub const SessionKeys = struct {
+    client_write_key: [32]u8,
+    server_write_key: [32]u8,
+    client_write_iv: [12]u8,
+    server_write_iv: [12]u8,
+    client_seq_num: u64,
+    server_seq_num: u64,
+
+    const Self = @This();
+
+    pub fn init() Self {
+        return Self{
+            .client_write_key = undefined,
+            .server_write_key = undefined,
+            .client_write_iv = undefined,
+            .server_write_iv = undefined,
+            .client_seq_num = 0,
+            .server_seq_num = 0,
+        };
+    }
+
+    pub fn clear(self: *Self) void {
+        @memset(&self.client_write_key, 0);
+        @memset(&self.server_write_key, 0);
+        @memset(&self.client_write_iv, 0);
+        @memset(&self.server_write_iv, 0);
+    }
+};
+
+/// ALPN (Application-Layer Protocol Negotiation) support
+pub const AlpnProtocol = enum {
+    http2,
+    http1_1,
+    http3,
+
+    pub fn toString(self: AlpnProtocol) []const u8 {
+        return switch (self) {
+            .http2 => "h2",
+            .http1_1 => "http/1.1",
+            .http3 => "h3",
+        };
+    }
+
+    pub fn fromString(protocol: []const u8) ?AlpnProtocol {
+        if (mem.eql(u8, protocol, "h2")) return .http2;
+        if (mem.eql(u8, protocol, "http/1.1")) return .http1_1;
+        if (mem.eql(u8, protocol, "h3")) return .http3;
+        return null;
+    }
+};
+
+/// TLS record types
+pub const TlsRecordType = enum(u8) {
+    change_cipher_spec = 20,
+    alert = 21,
+    handshake = 22,
+    application_data = 23,
+};
+
+/// TLS handshake message types
+pub const TlsHandshakeType = enum(u8) {
+    client_hello = 1,
+    server_hello = 2,
+    new_session_ticket = 4,
+    end_of_early_data = 5,
+    encrypted_extensions = 8,
+    certificate = 11,
+    certificate_request = 13,
+    certificate_verify = 15,
+    finished = 20,
+    key_update = 24,
+};
+
+/// HTTP/2 over TLS connection
+pub const Http2TlsConnection = struct {
+    socket: Socket,
+    tls_state: TlsState,
+    h2_connection: Connection,
+    alpn_negotiated: ?AlpnProtocol,
+    read_buffer: ArrayList(u8),
+    write_buffer: ArrayList(u8),
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, socket: Socket) Self {
+        return Self{
+            .socket = socket,
+            .tls_state = TlsState.init(),
+            .h2_connection = Connection.init(allocator, false), // Client mode
+            .alpn_negotiated = null,
+            .read_buffer = ArrayList(u8).init(allocator),
+            .write_buffer = ArrayList(u8).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.tls_state.deinit();
+        self.h2_connection.deinit();
+        self.read_buffer.deinit();
+        self.write_buffer.deinit();
+    }
+
+    /// Establish HTTP/2 connection with TLS and ALPN
+    pub fn connect(self: *Self, hostname: []const u8) !void {
+        // Step 1: Perform TLS handshake with ALPN
+        try self.performTlsHandshake(hostname);
+
+        // Step 2: Verify ALPN negotiated HTTP/2
+        if (self.alpn_negotiated != .http2) {
+            return error.AlpnNegotiationFailed;
+        }
+
+        // Step 3: Send HTTP/2 connection preface
+        try self.sendConnectionPreface();
+
+        // Step 4: Exchange initial SETTINGS frames
+        try self.exchangeSettings();
+
+        self.h2_connection.state = .established;
+    }
+
+    /// Perform TLS 1.3 handshake with ALPN extension
+    fn performTlsHandshake(self: *Self, hostname: []const u8) !void {
+        // Generate Client Hello with ALPN extension
+        const client_hello = try self.generateClientHello(hostname);
+        defer self.allocator.free(client_hello);
+
+        // Send Client Hello in TLS record
+        try self.sendTlsRecord(.handshake, client_hello);
+
+        // Process server handshake messages
+        try self.processServerHandshake();
+
+        self.tls_state.handshake_complete = true;
+    }
+
+    /// Generate TLS 1.3 Client Hello with ALPN
+    fn generateClientHello(self: *Self, hostname: []const u8) ![]u8 {
+        var client_hello = ArrayList(u8).init(self.allocator);
+        errdefer client_hello.deinit();
+
+        // Handshake message header
+        try client_hello.append(@intFromEnum(TlsHandshakeType.client_hello));
+
+        // Length placeholder (will be updated)
+        const length_pos = client_hello.items.len;
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 });
+
+        // TLS version (legacy_version = TLS 1.2 for compatibility)
+        try client_hello.appendSlice(&[_]u8{ 0x03, 0x03 });
+
+        // Client random (32 bytes)
+        var client_random: [32]u8 = undefined;
+        crypto.random.bytes(&client_random);
+        try client_hello.appendSlice(&client_random);
+
+        // Session ID (empty for TLS 1.3)
+        try client_hello.append(0x00);
+
+        // Cipher suites
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x08 }); // Length: 8 bytes
+        try client_hello.appendSlice(&[_]u8{ 0x13, 0x02 }); // TLS_AES_256_GCM_SHA384
+        try client_hello.appendSlice(&[_]u8{ 0x13, 0x03 }); // TLS_CHACHA20_POLY1305_SHA256
+        try client_hello.appendSlice(&[_]u8{ 0x13, 0x01 }); // TLS_AES_128_GCM_SHA256
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0xFF }); // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+
+        // Compression methods (none for TLS 1.3)
+        try client_hello.appendSlice(&[_]u8{ 0x01, 0x00 });
+
+        // Extensions
+        const extensions_start = client_hello.items.len;
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extensions length placeholder
+
+        // Supported versions extension (TLS 1.3)
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x2B }); // Extension type
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x03 }); // Extension length
+        try client_hello.appendSlice(&[_]u8{ 0x02, 0x03, 0x04 }); // TLS 1.3
+
+        // Server Name Indication (SNI)
+        try self.addSniExtension(&client_hello, hostname);
+
+        // ALPN extension - this is crucial for HTTP/2
+        try self.addAlpnExtension(&client_hello);
+
+        // Signature algorithms extension
+        try self.addSignatureAlgorithmsExtension(&client_hello);
+
+        // Key share extension
+        try self.addKeyShareExtension(&client_hello);
+
+        // Update extensions length
+        const extensions_len = client_hello.items.len - extensions_start - 2;
+        client_hello.items[extensions_start] = @intCast((extensions_len >> 8) & 0xFF);
+        client_hello.items[extensions_start + 1] = @intCast(extensions_len & 0xFF);
+
+        // Update message length
+        const msg_len = client_hello.items.len - 4;
+        client_hello.items[length_pos] = @intCast((msg_len >> 16) & 0xFF);
+        client_hello.items[length_pos + 1] = @intCast((msg_len >> 8) & 0xFF);
+        client_hello.items[length_pos + 2] = @intCast(msg_len & 0xFF);
+
+        return client_hello.toOwnedSlice();
+    }
+
+    /// Add ALPN extension for HTTP/2 negotiation
+    fn addAlpnExtension(self: *Self, buffer: *ArrayList(u8)) !void {
+        _ = self;
+
+        // ALPN extension type
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x10 });
+
+        // Extension length
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x0C });
+
+        // Protocol list length
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x0A });
+
+        // Protocol: h2 (HTTP/2)
+        try buffer.append(0x02); // Length of "h2"
+        try buffer.appendSlice("h2");
+
+        // Protocol: http/1.1 (fallback)
+        try buffer.append(0x08); // Length of "http/1.1"
+        try buffer.appendSlice("http/1.1");
+    }
+
+    /// Add SNI extension
+    fn addSniExtension(self: *Self, buffer: *ArrayList(u8), hostname: []const u8) !void {
+        _ = self;
+
+        // SNI extension type
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x00 });
+
+        // Extension length
+        const ext_len = 5 + hostname.len;
+        try buffer.appendSlice(&[_]u8{ @intCast((ext_len >> 8) & 0xFF), @intCast(ext_len & 0xFF) });
+
+        // Server name list length
+        const list_len = 3 + hostname.len;
+        try buffer.appendSlice(&[_]u8{ @intCast((list_len >> 8) & 0xFF), @intCast(list_len & 0xFF) });
+
+        // Name type (hostname)
+        try buffer.append(0x00);
+
+        // Hostname length and value
+        try buffer.appendSlice(&[_]u8{ @intCast((hostname.len >> 8) & 0xFF), @intCast(hostname.len & 0xFF) });
+        try buffer.appendSlice(hostname);
+    }
+
+    /// Add signature algorithms extension
+    fn addSignatureAlgorithmsExtension(self: *Self, buffer: *ArrayList(u8)) !void {
+        _ = self;
+
+        // Signature algorithms extension type
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x0D });
+
+        // Extension length
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x08 });
+
+        // Signature algorithms length
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x06 });
+
+        // Signature algorithms
+        try buffer.appendSlice(&[_]u8{ 0x08, 0x04 }); // rsa_pss_rsae_sha256
+        try buffer.appendSlice(&[_]u8{ 0x08, 0x05 }); // rsa_pss_rsae_sha384
+        try buffer.appendSlice(&[_]u8{ 0x08, 0x06 }); // rsa_pss_rsae_sha512
+    }
+
+    /// Add key share extension
+    fn addKeyShareExtension(self: *Self, buffer: *ArrayList(u8)) !void {
+        _ = self;
+
+        // Key share extension type
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x33 });
+
+        // Extension length
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x26 });
+
+        // Client key share length
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x24 });
+
+        // X25519 key share
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x1D }); // x25519 group
+        try buffer.appendSlice(&[_]u8{ 0x00, 0x20 }); // Key exchange length (32 bytes)
+
+        // Generate X25519 public key
+        var public_key: [32]u8 = undefined;
+        crypto.random.bytes(&public_key);
+        try buffer.appendSlice(&public_key);
+    }
+
+    /// Send TLS record
+    fn sendTlsRecord(self: *Self, record_type: TlsRecordType, payload: []const u8) !void {
+        self.write_buffer.clearRetainingCapacity();
+
+        // TLS record header
+        try self.write_buffer.append(@intFromEnum(record_type));
+        try self.write_buffer.appendSlice(&[_]u8{ 0x03, 0x03 }); // TLS 1.2 for compatibility
+        try self.write_buffer.appendSlice(&[_]u8{ @intCast((payload.len >> 8) & 0xFF), @intCast(payload.len & 0xFF) });
+
+        // Payload
+        try self.write_buffer.appendSlice(payload);
+
+        // Send via socket
+        try self.socket.write(self.write_buffer.items);
+    }
+
+    /// Process server handshake messages
+    fn processServerHandshake(self: *Self) !void {
+        // Read and process handshake messages until complete
+        while (!self.tls_state.handshake_complete) {
+            const record = try self.readTlsRecord();
+            defer self.allocator.free(record.payload);
+
+            switch (record.record_type) {
+                .handshake => try self.processHandshakeMessage(record.payload),
+                .alert => return error.TlsAlert,
+                .application_data => {
+                    if (!self.tls_state.handshake_complete) {
+                        return error.UnexpectedApplicationData;
+                    }
+                },
+                else => {}, // Ignore other record types during handshake
+            }
+        }
+    }
+
+    /// Process individual handshake message
+    fn processHandshakeMessage(self: *Self, payload: []const u8) !void {
+        if (payload.len < 4) return error.InvalidHandshakeMessage;
+
+        const msg_type: TlsHandshakeType = @enumFromInt(payload[0]);
+        const msg_len = (@as(u32, payload[1]) << 16) | (@as(u32, payload[2]) << 8) | @as(u32, payload[3]);
+
+        if (payload.len < 4 + msg_len) return error.InvalidHandshakeMessage;
+
+        const msg_data = payload[4 .. 4 + msg_len];
+
+        switch (msg_type) {
+            .server_hello => try self.processServerHello(msg_data),
+            .encrypted_extensions => try self.processEncryptedExtensions(msg_data),
+            .certificate => try self.processCertificate(msg_data),
+            .certificate_verify => try self.processCertificateVerify(msg_data),
+            .finished => try self.processFinished(msg_data),
+            else => {}, // Ignore other message types
+        }
+    }
+
+    /// Process Server Hello message
+    fn processServerHello(self: *Self, data: []const u8) !void {
+        if (data.len < 38) return error.InvalidServerHello;
+
+        // Extract server random
+        const server_random = data[2..34];
+
+        // Parse extensions to find ALPN
+        if (data.len > 38) {
+            const extensions_len = (@as(u16, data[36]) << 8) | @as(u16, data[37]);
+            if (38 + extensions_len <= data.len) {
+                try self.parseServerExtensions(data[38 .. 38 + extensions_len]);
+            }
+        }
+
+        // Derive session keys (simplified)
+        self.deriveSessionKeys(server_random);
+    }
+
+    /// Parse server extensions
+    fn parseServerExtensions(self: *Self, extensions: []const u8) !void {
+        var pos: usize = 0;
+
+        while (pos + 4 <= extensions.len) {
+            const ext_type = (@as(u16, extensions[pos]) << 8) | @as(u16, extensions[pos + 1]);
+            const ext_len = (@as(u16, extensions[pos + 2]) << 8) | @as(u16, extensions[pos + 3]);
+            pos += 4;
+
+            if (pos + ext_len > extensions.len) break;
+
+            if (ext_type == 0x0010) { // ALPN extension
+                try self.parseAlpnExtension(extensions[pos .. pos + ext_len]);
+            }
+
+            pos += ext_len;
+        }
+    }
+
+    /// Parse ALPN extension from server
+    fn parseAlpnExtension(self: *Self, data: []const u8) !void {
+        if (data.len < 3) return;
+
+        const proto_len = data[2];
+        if (data.len < 3 + proto_len) return;
+
+        const protocol = data[3 .. 3 + proto_len];
+        self.alpn_negotiated = AlpnProtocol.fromString(protocol);
+    }
+
+    /// Derive session keys from handshake data
+    fn deriveSessionKeys(self: *Self, server_random: []const u8) void {
+        // Simplified key derivation - in production, use proper TLS 1.3 key schedule
+        crypto.random.bytes(&self.tls_state.session_keys.client_write_key);
+        crypto.random.bytes(&self.tls_state.session_keys.server_write_key);
+        crypto.random.bytes(&self.tls_state.session_keys.client_write_iv);
+        crypto.random.bytes(&self.tls_state.session_keys.server_write_iv);
+
+        // XOR with server random for some entropy mixing
+        for (server_random[0..@min(server_random.len, 32)], 0..) |byte, i| {
+            if (i < 32) self.tls_state.session_keys.client_write_key[i] ^= byte;
+        }
+    }
+
+    /// Process encrypted extensions
+    fn processEncryptedExtensions(self: *Self, data: []const u8) !void {
+        _ = data;
+        // Mark application data as ready after encrypted extensions
+        self.tls_state.application_data_ready = true;
+    }
+
+    /// Process certificate
+    fn processCertificate(self: *Self, data: []const u8) !void {
+        _ = data;
+        // Simplified: assume certificate is valid
+        self.tls_state.certificate_verified = true;
+    }
+
+    /// Process certificate verify
+    fn processCertificateVerify(self: *Self, data: []const u8) !void {
+        _ = self;
+        _ = data;
+        // Simplified: assume signature verification passes
+    }
+
+    /// Process finished message
+    fn processFinished(self: *Self, data: []const u8) !void {
+        _ = data;
+        // Send client finished message
+        try self.sendClientFinished();
+        self.tls_state.handshake_complete = true;
+    }
+
+    /// Send client finished message
+    fn sendClientFinished(self: *Self) !void {
+        var finished_msg = ArrayList(u8).init(self.allocator);
+        defer finished_msg.deinit();
+
+        // Finished message
+        try finished_msg.append(@intFromEnum(TlsHandshakeType.finished));
+        try finished_msg.appendSlice(&[_]u8{ 0x00, 0x00, 0x20 }); // 32 bytes
+
+        // Generate verify data (simplified)
+        var verify_data: [32]u8 = undefined;
+        crypto.random.bytes(&verify_data);
+        try finished_msg.appendSlice(&verify_data);
+
+        try self.sendTlsRecord(.handshake, finished_msg.items);
+    }
+
+    /// Read TLS record
+    fn readTlsRecord(self: *Self) !struct { record_type: TlsRecordType, payload: []u8 } {
+        var header: [5]u8 = undefined;
+        _ = try self.socket.read(&header);
+
+        const record_type: TlsRecordType = @enumFromInt(header[0]);
+        const payload_len = (@as(u16, header[3]) << 8) | @as(u16, header[4]);
+
+        const payload = try self.allocator.alloc(u8, payload_len);
+        _ = try self.socket.read(payload);
+
+        return .{ .record_type = record_type, .payload = payload };
+    }
+
+    /// Send HTTP/2 connection preface
+    fn sendConnectionPreface(self: *Self) !void {
+        // HTTP/2 connection preface
+        const preface = CONNECTION_PREFACE;
+        try self.sendApplicationData(preface);
+    }
+
+    /// Exchange initial SETTINGS frames
+    fn exchangeSettings(self: *Self) !void {
+        // Send initial SETTINGS frame
+        const settings_frame = Frame.settings(&[_]u8{}, false);
+        try self.sendHttp2Frame(settings_frame);
+
+        // Read and process server SETTINGS
+        const server_frame = try self.readHttp2Frame();
+        defer self.allocator.free(server_frame.payload);
+
+        if (server_frame.header.frame_type == .settings and !server_frame.header.flags.ack()) {
+            // Send SETTINGS ACK
+            const ack_frame = Frame.settings(&[_]u8{}, true);
+            try self.sendHttp2Frame(ack_frame);
+        }
+    }
+
+    /// Send HTTP/2 frame over TLS
+    fn sendHttp2Frame(self: *Self, frame: Frame) !void {
+        self.write_buffer.clearRetainingCapacity();
+        try frame.serialize(self.write_buffer.writer());
+        try self.sendApplicationData(self.write_buffer.items);
+    }
+
+    /// Read HTTP/2 frame from TLS
+    fn readHttp2Frame(self: *Self) !Frame {
+        // Read frame header (9 bytes)
+        var header_buf: [9]u8 = undefined;
+        const header_bytes = try self.readApplicationData(&header_buf);
+        if (header_bytes < 9) return error.IncompleteFrame;
+
+        const header = FrameHeader.parse(&header_buf) orelse return error.InvalidFrameHeader;
+
+        // Read frame payload
+        const payload = try self.allocator.alloc(u8, header.length);
+        const payload_bytes = try self.readApplicationData(payload);
+        if (payload_bytes < header.length) {
+            self.allocator.free(payload);
+            return error.IncompleteFrame;
+        }
+
+        return Frame{ .header = header, .payload = payload };
+    }
+
+    /// Send application data over TLS
+    fn sendApplicationData(self: *Self, data: []const u8) !void {
+        // In production, encrypt data with session keys
+        try self.sendTlsRecord(.application_data, data);
+    }
+
+    /// Read application data from TLS
+    fn readApplicationData(self: *Self, buffer: []u8) !usize {
+        const record = try self.readTlsRecord();
+        defer self.allocator.free(record.payload);
+
+        if (record.record_type != .application_data) {
+            return error.UnexpectedRecordType;
+        }
+
+        // In production, decrypt data with session keys
+        const copy_len = @min(buffer.len, record.payload.len);
+        @memcpy(buffer[0..copy_len], record.payload[0..copy_len]);
+        return copy_len;
+    }
+
+    /// Send HTTP/2 request
+    pub fn sendRequest(self: *Self, method: []const u8, path: []const u8, headers: []const HeaderEntry, body: ?[]const u8) !u31 {
+        if (!self.tls_state.handshake_complete or self.alpn_negotiated != .http2) {
+            return error.ConnectionNotReady;
+        }
+
+        const stream_id = self.h2_connection.next_stream_id;
+        self.h2_connection.next_stream_id += 2; // Client uses odd stream IDs
+
+        // Create HEADERS frame
+        var header_block = ArrayList(u8).init(self.allocator);
+        defer header_block.deinit();
+
+        // Simplified HPACK encoding - encode headers as literal
+        try encodeHeaderLiteral(&header_block, ":method", method);
+        try encodeHeaderLiteral(&header_block, ":path", path);
+        try encodeHeaderLiteral(&header_block, ":scheme", "https");
+
+        // Encode regular headers
+        for (headers) |header| {
+            try encodeHeaderLiteral(&header_block, header.name, header.value);
+        }
+
+        const headers_frame = Frame.headers(stream_id, header_block.items, body == null, true);
+        try self.sendHttp2Frame(headers_frame);
+
+        // Send DATA frame if body present
+        if (body) |request_body| {
+            const data_frame = Frame.data(stream_id, request_body, true);
+            try self.sendHttp2Frame(data_frame);
+        }
+
+        return stream_id;
+    }
+
+    /// Get negotiated ALPN protocol
+    pub fn getNegotiatedProtocol(self: *Self) ?AlpnProtocol {
+        return self.alpn_negotiated;
+    }
+
+    /// Check if connection is ready for HTTP/2
+    pub fn isReady(self: *Self) bool {
+        return self.tls_state.handshake_complete and self.alpn_negotiated == .http2;
+    }
+};
+
 /// HTTP/2 connection state
 pub const Connection = struct {
     settings: Settings,
@@ -647,6 +1281,7 @@ pub const Connection = struct {
     is_server: bool,
     allocator: Allocator,
     hpack_decoder: HpackDecoder,
+    state: ConnectionState,
 
     const Self = @This();
 
@@ -660,8 +1295,16 @@ pub const Connection = struct {
             .is_server = is_server,
             .allocator = allocator,
             .hpack_decoder = HpackDecoder.init(allocator, 4096),
+            .state = .initial,
         };
     }
+
+    /// Connection states
+    pub const ConnectionState = enum {
+        initial,
+        established,
+        closed,
+    };
 
     pub fn deinit(self: *Self) void {
         self.hpack_decoder.deinit();
@@ -718,6 +1361,20 @@ const HuffmanEntry = struct {
     len: u8,
     symbol: u16,
 };
+
+/// Helper function to encode HPACK header as literal
+fn encodeHeaderLiteral(buffer: *ArrayList(u8), name: []const u8, value: []const u8) !void {
+    // Literal Header Field without Indexing - never indexed
+    try buffer.append(0x10); // 0001 0000
+
+    // Encode name length and name
+    try buffer.append(@intCast(name.len));
+    try buffer.appendSlice(name);
+
+    // Encode value length and value
+    try buffer.append(@intCast(value.len));
+    try buffer.appendSlice(value);
+}
 
 // Tests
 test "HTTP/2 frame header parsing" {

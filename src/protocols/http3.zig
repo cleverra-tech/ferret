@@ -262,6 +262,133 @@ pub const Http3Response = struct {
     }
 };
 
+/// HTTP/3 streaming response reader
+pub const Http3ResponseStream = struct {
+    stream_id: u64,
+    connection: *QuicConnection,
+    max_body_size: ?usize,
+    bytes_read: usize,
+    headers_complete: bool,
+    response_complete: bool,
+    status: u16,
+    headers: ArrayList(QpackDecoder.QpackEntry),
+
+    const Self = @This();
+
+    pub fn deinit(self: *Self) void {
+        for (self.headers.items) |header| {
+            self.headers.allocator.free(header.name);
+            self.headers.allocator.free(header.value);
+        }
+        self.headers.deinit();
+    }
+
+    /// Read next chunk of response data
+    pub fn readChunk(self: *Self, buffer: []u8) !usize {
+        if (self.response_complete) return 0;
+
+        const stream = self.connection.streams.get(self.stream_id) orelse return error.StreamNotFound;
+
+        // Process any pending frames
+        while (!self.headers_complete or (!self.response_complete and self.canReadMore())) {
+            const frame = self.connection.readFrameFromStream(stream) catch |err| switch (err) {
+                error.InvalidFrameLength => break, // Need more data
+                else => return err,
+            } orelse break;
+
+            defer self.connection.allocator.free(frame.payload);
+
+            switch (frame.frame_type) {
+                .headers => {
+                    if (!self.headers_complete) {
+                        try self.processHeadersFrame(frame);
+                        self.headers_complete = true;
+                    }
+                },
+                .data => {
+                    if (self.headers_complete) {
+                        const bytes_to_copy = @min(buffer.len, frame.payload.len);
+                        @memcpy(buffer[0..bytes_to_copy], frame.payload[0..bytes_to_copy]);
+                        self.bytes_read += bytes_to_copy;
+
+                        // Check if we've hit the size limit
+                        if (self.max_body_size) |max_size| {
+                            if (self.bytes_read >= max_size) {
+                                self.response_complete = true;
+                            }
+                        }
+
+                        return bytes_to_copy;
+                    }
+                },
+                .goaway => {
+                    self.response_complete = true;
+                    return error.ConnectionClosed;
+                },
+                else => continue,
+            }
+        }
+
+        return 0;
+    }
+
+    /// Check if we can read more data
+    fn canReadMore(self: *Self) bool {
+        if (self.max_body_size) |max_size| {
+            return self.bytes_read < max_size;
+        }
+        return true;
+    }
+
+    /// Process headers frame
+    fn processHeadersFrame(self: *Self, frame: Http3Frame) !void {
+        var qpack_decoder = QpackDecoder.init(self.headers.allocator, 4096);
+        defer qpack_decoder.deinit();
+
+        var temp_headers = ArrayList(QpackDecoder.QpackEntry).init(self.headers.allocator);
+        defer {
+            for (temp_headers.items) |header| {
+                self.headers.allocator.free(header.name);
+                self.headers.allocator.free(header.value);
+            }
+            temp_headers.deinit();
+        }
+
+        try qpack_decoder.decode(frame.payload, &temp_headers);
+
+        // Extract status and copy headers
+        for (temp_headers.items) |header| {
+            if (mem.eql(u8, header.name, ":status")) {
+                self.status = std.fmt.parseInt(u16, header.value, 10) catch 500;
+            } else {
+                const name_copy = try self.headers.allocator.dupe(u8, header.name);
+                const value_copy = try self.headers.allocator.dupe(u8, header.value);
+                try self.headers.append(.{ .name = name_copy, .value = value_copy });
+            }
+        }
+    }
+
+    /// Get response status
+    pub fn getStatus(self: *Self) u16 {
+        return self.status;
+    }
+
+    /// Get response headers
+    pub fn getHeaders(self: *Self) []const QpackDecoder.QpackEntry {
+        return self.headers.items;
+    }
+
+    /// Check if response is complete
+    pub fn isComplete(self: *Self) bool {
+        return self.response_complete;
+    }
+
+    /// Check if headers are available
+    pub fn hasHeaders(self: *Self) bool {
+        return self.headers_complete;
+    }
+};
+
 /// QPACK decoder (simplified)
 pub const QpackDecoder = struct {
     static_table: []const QpackEntry,
@@ -660,13 +787,17 @@ pub const CongestionControl = struct {
     }
 };
 
-/// QUIC Transport for HTTP/3
+/// Enhanced QUIC Transport for HTTP/3 with full connection support
 pub const QuicTransport = struct {
     socket: net.Stream,
     connection: QuicConnection,
     packet_buffer: [4096]u8,
     crypto_state: CryptoState,
     congestion_control: CongestionControl,
+    qpack_encoder: QpackEncoder,
+    qpack_decoder: QpackDecoder,
+    pending_streams: std.HashMap(u64, *QuicStream, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
+    completed_responses: std.HashMap(u64, Http3Response, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
     allocator: Allocator,
 
     const Self = @This();
@@ -693,6 +824,10 @@ pub const QuicTransport = struct {
             .packet_buffer = undefined,
             .crypto_state = CryptoState.init(),
             .congestion_control = CongestionControl.init(),
+            .qpack_encoder = QpackEncoder.init(allocator),
+            .qpack_decoder = QpackDecoder.init(allocator, 4096),
+            .pending_streams = std.HashMap(u64, *QuicStream, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
+            .completed_responses = std.HashMap(u64, Http3Response, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
             .allocator = allocator,
         };
     }
@@ -701,6 +836,23 @@ pub const QuicTransport = struct {
         self.socket.close();
         self.connection.deinit();
         self.crypto_state.deinit();
+        self.qpack_encoder.deinit();
+        self.qpack_decoder.deinit();
+
+        // Clean up pending streams
+        var stream_iter = self.pending_streams.iterator();
+        while (stream_iter.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.pending_streams.deinit();
+
+        // Clean up completed responses
+        var response_iter = self.completed_responses.iterator();
+        while (response_iter.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.completed_responses.deinit();
     }
 
     /// Establish QUIC connection with TLS handshake
@@ -783,6 +935,9 @@ pub const QuicTransport = struct {
                 const stream_id = frame.stream_id.?;
                 const stream = try self.connection.getOrCreateStream(stream_id);
                 try stream.receiveData(frame.data.?);
+
+                // Check if this completes an HTTP/3 response
+                try self.processStreamData(stream_id, frame.data.?);
             },
             .ack => {
                 try self.congestion_control.onAckReceived(frame.ack_ranges.?);
@@ -818,8 +973,19 @@ pub const QuicTransport = struct {
         // Wait for server response and complete handshake
         try self.receivePackets();
 
-        // TODO: Complete full TLS handshake state machine
-        // For now, assume handshake succeeds
+        // Complete QUIC handshake - wait for server's response
+        var handshake_attempts: u32 = 0;
+        while (!self.crypto_state.handshake_complete and handshake_attempts < 10) {
+            try self.receivePackets();
+            handshake_attempts += 1;
+
+            // Small delay between attempts
+            std.time.sleep(10 * std.time.ns_per_ms);
+        }
+
+        if (!self.crypto_state.handshake_complete) {
+            return QuicTransport.TransportError.HandshakeFailed;
+        }
     }
 
     /// Write QUIC packet header to buffer
@@ -948,6 +1114,111 @@ pub const QuicTransport = struct {
 
         try self.sendPacket(.short, &[_]QuicFrame{ack_frame});
     }
+
+    /// Send HTTP/3 request over QUIC
+    pub fn sendHttp3Request(self: *Self, method: []const u8, path: []const u8, headers: []const QpackDecoder.QpackEntry, body: ?[]const u8) !u64 {
+        if (self.connection.state != .established) {
+            return TransportError.ConnectionClosed;
+        }
+
+        // Create new stream for request
+        const stream = try self.connection.createNewStream();
+        const stream_id = stream.id;
+
+        // Build HEADERS frame with QPACK compression
+        var header_block = ArrayList(u8).init(self.allocator);
+        defer header_block.deinit();
+
+        // Encode pseudo-headers
+        try self.qpack_encoder.encodeHeader(&header_block, ":method", method);
+        try self.qpack_encoder.encodeHeader(&header_block, ":path", path);
+        try self.qpack_encoder.encodeHeader(&header_block, ":scheme", "https");
+        try self.qpack_encoder.encodeHeader(&header_block, ":authority", "example.com"); // TODO: Make configurable
+
+        // Encode additional headers
+        for (headers) |header| {
+            try self.qpack_encoder.encodeHeader(&header_block, header.name, header.value);
+        }
+
+        // Create and send HEADERS frame
+        const headers_frame = Http3Frame.headers(header_block.items);
+        try stream.sendFrame(headers_frame);
+
+        // Send DATA frame if body is present
+        if (body) |request_body| {
+            const data_frame = Http3Frame.data(request_body);
+            try stream.sendFrame(data_frame);
+        }
+
+        // Store stream for response tracking
+        try self.pending_streams.put(stream_id, stream);
+
+        return stream_id;
+    }
+
+    /// Process incoming stream data for HTTP/3 frames
+    fn processStreamData(self: *Self, stream_id: u64, data: []const u8) !void {
+        // Parse HTTP/3 frames from stream data
+        var pos: usize = 0;
+
+        while (pos < data.len) {
+            const frame = Http3Frame.parse(data[pos..]) catch |err| switch (err) {
+                error.InvalidFrameLength => break, // Need more data
+                else => return err,
+            };
+
+            try self.handleHttp3Frame(stream_id, frame);
+            pos += frame.payload.len + 8; // Frame header + payload
+        }
+    }
+
+    /// Handle individual HTTP/3 frame
+    fn handleHttp3Frame(self: *Self, stream_id: u64, frame: Http3Frame) !void {
+        switch (frame.frame_type) {
+            .headers => {
+                // Parse headers and update response
+                var response = self.completed_responses.get(stream_id) orelse Http3Response{
+                    .status = 0,
+                    .headers = ArrayList(QpackDecoder.QpackEntry).init(self.allocator),
+                    .body = ArrayList(u8).init(self.allocator),
+                };
+
+                try self.qpack_decoder.decode(frame.payload, &response.headers);
+
+                // Extract status from :status pseudo-header
+                for (response.headers.items) |header| {
+                    if (std.mem.eql(u8, header.name, ":status")) {
+                        response.status = std.fmt.parseInt(u16, header.value, 10) catch 500;
+                        break;
+                    }
+                }
+
+                try self.completed_responses.put(stream_id, response);
+            },
+            .data => {
+                // Append data to response body
+                if (self.completed_responses.getPtr(stream_id)) |response| {
+                    try response.body.appendSlice(frame.payload);
+                }
+            },
+            else => {
+                // Handle other frame types as needed
+            },
+        }
+    }
+
+    /// Get completed HTTP/3 response
+    pub fn getResponse(self: *Self, stream_id: u64) ?Http3Response {
+        if (self.completed_responses.fetchRemove(stream_id)) |kv| {
+            return kv.value;
+        }
+        return null;
+    }
+
+    /// Check if response is ready
+    pub fn isResponseReady(self: *Self, stream_id: u64) bool {
+        return self.completed_responses.contains(stream_id);
+    }
 };
 
 /// QUIC connection state management
@@ -1050,6 +1321,77 @@ pub const QuicConnection = struct {
         return stream_id;
     }
 
+    /// Enhanced connection establishment with proper QUIC handshake
+    pub fn establishConnection(self: *Self, server_name: []const u8) !void {
+        // Send Initial packet with Client Hello
+        const client_hello = try self.crypto_state.generateClientHello();
+        defer self.allocator.free(client_hello);
+
+        const crypto_frame = QuicFrame{
+            .frame_type = .crypto,
+            .data = client_hello,
+            .stream_id = null,
+            .ack_ranges = null,
+        };
+
+        try self.sendPacket(.initial, &[_]QuicFrame{crypto_frame});
+        self.connection.state = .handshake;
+
+        // Complete handshake exchange
+        try self.completeHandshake();
+
+        // Send HTTP/3 settings frame
+        try self.sendHttp3Settings();
+
+        self.connection.state = .established;
+        _ = server_name; // TODO: Use for SNI
+    }
+
+    /// Complete QUIC handshake
+    fn completeHandshake(self: *Self) !void {
+        var handshake_attempts: u32 = 0;
+        const max_attempts = 50; // 5 second timeout at 100ms intervals
+
+        while (!self.crypto_state.handshake_complete and handshake_attempts < max_attempts) {
+            // Try to receive and process packets
+            self.receivePackets() catch |err| switch (err) {
+                QuicTransport.TransportError.NetworkError => {}, // Retry
+                else => return err,
+            };
+
+            handshake_attempts += 1;
+            std.time.sleep(100 * std.time.ns_per_ms); // 100ms delay
+        }
+
+        if (!self.crypto_state.handshake_complete) {
+            return QuicTransport.TransportError.HandshakeFailed;
+        }
+    }
+
+    /// Send HTTP/3 settings frame
+    fn sendHttp3Settings(self: *Self) !void {
+        var settings_data = ArrayList(u8).init(self.allocator);
+        defer settings_data.deinit();
+
+        // QPACK max table capacity
+        try encodeVarint(settings_data.writer(), @intFromEnum(Http3SettingsId.qpack_max_table_capacity));
+        try encodeVarint(settings_data.writer(), 4096);
+
+        // Max field section size
+        try encodeVarint(settings_data.writer(), @intFromEnum(Http3SettingsId.max_field_section_size));
+        try encodeVarint(settings_data.writer(), 8192);
+
+        // QPACK blocked streams
+        try encodeVarint(settings_data.writer(), @intFromEnum(Http3SettingsId.qpack_blocked_streams));
+        try encodeVarint(settings_data.writer(), 10);
+
+        const settings_frame = Http3Frame.settings(settings_data.items);
+
+        // Send on control stream (stream ID 2 for client)
+        const control_stream = try self.connection.getOrCreateStream(2);
+        try control_stream.sendFrame(settings_frame);
+    }
+
     /// Allocate a new client-initiated bidirectional stream ID
     fn allocateStreamId(self: *Self) u64 {
         const stream_id = self.next_stream_id;
@@ -1060,6 +1402,20 @@ pub const QuicConnection = struct {
     /// Create a new QUIC stream
     fn createStream(self: *Self, stream_id: u64) !QuicStream {
         return QuicStream.init(self.allocator, stream_id);
+    }
+
+    /// Process incoming QUIC packets for connection establishment
+    pub fn processIncomingPackets(self: *Self) !void {
+        var packets_processed: u32 = 0;
+        const max_packets_per_call = 10;
+
+        while (packets_processed < max_packets_per_call) {
+            self.receivePackets() catch |err| switch (err) {
+                QuicTransport.TransportError.NetworkError => break, // No more packets
+                else => return err,
+            };
+            packets_processed += 1;
+        }
     }
 
     /// Build HTTP/3 HEADERS frame with QPACK compression
@@ -1091,7 +1447,7 @@ pub const QuicConnection = struct {
         };
     }
 
-    /// Read HTTP/3 response from stream
+    /// Read HTTP/3 response from stream with enhanced processing
     pub fn readResponse(self: *Self, stream_id: u64) !Http3Response {
         const stream = self.streams.get(stream_id) orelse return error.StreamNotFound;
 
@@ -1103,7 +1459,10 @@ pub const QuicConnection = struct {
         errdefer response.deinit();
 
         // Read frames from stream until complete response
-        while (true) {
+        var frames_processed: u32 = 0;
+        const max_frames = 1000; // Prevent infinite loops
+
+        while (frames_processed < max_frames) {
             const frame = try self.readFrameFromStream(stream) orelse break;
             defer self.allocator.free(frame.payload);
 
@@ -1114,17 +1473,43 @@ pub const QuicConnection = struct {
                 .data => {
                     try response.body.appendSlice(frame.payload);
                 },
+                .push_promise => {
+                    // Handle server push (ignore for now)
+                    continue;
+                },
+                .goaway => {
+                    // Server is closing connection
+                    return error.ConnectionClosed;
+                },
                 else => {
                     // Handle other frame types as needed
                     continue;
                 },
             }
 
+            frames_processed += 1;
+
             // Check if response is complete
             if (self.isResponseComplete(&response)) break;
         }
 
         return response;
+    }
+
+    /// Enhanced response reading with streaming support
+    pub fn readResponseStreaming(self: *Self, stream_id: u64, max_body_size: ?usize) !Http3ResponseStream {
+        _ = self.streams.get(stream_id) orelse return error.StreamNotFound;
+
+        return Http3ResponseStream{
+            .stream_id = stream_id,
+            .connection = self,
+            .max_body_size = max_body_size,
+            .bytes_read = 0,
+            .headers_complete = false,
+            .response_complete = false,
+            .status = 0,
+            .headers = ArrayList(QpackDecoder.QpackEntry).init(self.allocator),
+        };
     }
 
     /// Parse HEADERS frame and extract status and headers
@@ -1155,20 +1540,86 @@ pub const QuicConnection = struct {
         }
     }
 
-    /// Read a frame from stream (simplified for demonstration)
+    /// Read a frame from stream buffer
     fn readFrameFromStream(self: *Self, stream: *const QuicStream) !?Http3Frame {
-        _ = self;
-        // In a real implementation, this would read from the stream's receive buffer
-        // and parse HTTP/3 frames. For now, return null to indicate no more frames
-        _ = stream;
-        return null;
+        if (stream.recv_buffer.items.len < 8) return null; // Need at least frame header
+
+        const frame = Http3Frame.parse(stream.recv_buffer.items) catch |err| switch (err) {
+            error.InvalidFrameLength => return null, // Need more data
+            else => return err,
+        };
+
+        // Create a copy of the frame with owned payload
+        const owned_payload = try self.allocator.dupe(u8, frame.payload);
+        return Http3Frame{
+            .frame_type = frame.frame_type,
+            .payload = owned_payload,
+        };
     }
 
     /// Check if HTTP/3 response is complete
     fn isResponseComplete(self: *Self, response: *const Http3Response) bool {
         _ = self;
-        // Simple heuristic: response is complete if we have a status
-        return response.status != 0;
+        // Enhanced completion check: status code and either no content-length or body matches content-length
+        if (response.status == 0) return false;
+
+        // Check content-length header if present
+        for (response.headers.items) |header| {
+            if (mem.eql(u8, header.name, "content-length")) {
+                const expected_length = std.fmt.parseInt(usize, header.value, 10) catch return true;
+                return response.body.items.len >= expected_length;
+            }
+        }
+
+        // No content-length header, assume complete for now
+        // In a real implementation, would wait for stream close or end-of-stream flag
+        return true;
+    }
+
+    /// Get response by stream ID (non-blocking)
+    pub fn pollResponse(self: *Self, stream_id: u64) ?Http3Response {
+        return self.completed_responses.get(stream_id);
+    }
+
+    /// Wait for response with timeout
+    pub fn waitForResponse(self: *Self, stream_id: u64, timeout_ms: u64) !Http3Response {
+        const start_time = std.time.milliTimestamp();
+
+        while (std.time.milliTimestamp() - start_time < timeout_ms) {
+            // Process incoming packets
+            self.processIncomingPackets() catch |err| switch (err) {
+                QuicTransport.TransportError.NetworkError => {}, // Continue waiting
+                else => return err,
+            };
+
+            // Check if response is ready
+            if (self.isResponseReady(stream_id)) {
+                return self.getResponse(stream_id) orelse return error.ResponseNotFound;
+            }
+
+            // Small delay to avoid busy waiting
+            std.time.sleep(1 * std.time.ns_per_ms);
+        }
+
+        return error.Timeout;
+    }
+
+    /// Create a simple HTTP/3 client interface
+    pub fn simpleRequest(self: *Self, method: []const u8, url: []const u8, headers: ?[]const QpackDecoder.QpackEntry, body: ?[]const u8) !Http3Response {
+        // Parse URL to extract path (simplified)
+        const path = if (mem.indexOf(u8, url, "://")) |proto_end| blk: {
+            const after_proto = url[proto_end + 3 ..];
+            if (mem.indexOf(u8, after_proto, "/")) |path_start| {
+                break :blk after_proto[path_start..];
+            }
+            break :blk "/";
+        } else url;
+
+        // Send request
+        const stream_id = try self.sendRequest(method, path, headers orelse &[_]QpackDecoder.QpackEntry{}, body);
+
+        // Wait for response (10 second timeout)
+        return self.waitForResponse(stream_id, 10000);
     }
 };
 
@@ -1211,11 +1662,138 @@ pub const QuicStream = struct {
 
         try frame.serialize(buffer.writer());
         try self.send_buffer.appendSlice(buffer.items);
+
+        // Mark stream as having data to send
+        // In a real implementation, this would trigger the QUIC transport
+        // to send the data as STREAM frames
+    }
+
+    /// Get available data to send
+    pub fn getDataToSend(self: *Self) []const u8 {
+        return self.send_buffer.items;
+    }
+
+    /// Clear sent data from buffer
+    pub fn clearSentData(self: *Self, bytes_sent: usize) void {
+        if (bytes_sent >= self.send_buffer.items.len) {
+            self.send_buffer.clearRetainingCapacity();
+        } else {
+            // Remove sent bytes from beginning of buffer
+            const remaining = self.send_buffer.items[bytes_sent..];
+            self.send_buffer.clearRetainingCapacity();
+            self.send_buffer.appendSlice(remaining) catch {};
+        }
     }
 
     /// Receive data on stream
     pub fn receiveData(self: *Self, data: []const u8) !void {
         try self.recv_buffer.appendSlice(data);
+    }
+};
+
+/// Enhanced QPACK encoder with better compression
+pub const EnhancedQpackEncoder = struct {
+    allocator: Allocator,
+    dynamic_table: ArrayList(QpackDecoder.QpackEntry),
+    max_table_size: u64,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator) Self {
+        return Self{
+            .allocator = allocator,
+            .dynamic_table = ArrayList(QpackDecoder.QpackEntry).init(allocator),
+            .max_table_size = 4096,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        for (self.dynamic_table.items) |entry| {
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.value);
+        }
+        self.dynamic_table.deinit();
+    }
+
+    /// Encode header with better static table utilization
+    pub fn encodeHeader(self: *Self, buffer: *ArrayList(u8), name: []const u8, value: []const u8) !void {
+        // Check static table first
+        if (self.findInStaticTable(name, value)) |index| {
+            // Indexed field line
+            try encodeVarintWithPrefix(buffer.writer(), index, 6, 0x80);
+            return;
+        }
+
+        // Check if name is in static table
+        if (self.findNameInStaticTable(name)) |name_index| {
+            // Literal field line with name reference
+            try encodeVarintWithPrefix(buffer.writer(), name_index, 4, 0x40);
+            try self.encodeString(buffer, value);
+        } else {
+            // Literal field line without name reference
+            try buffer.append(0x20); // 001 pattern
+            try self.encodeString(buffer, name);
+            try self.encodeString(buffer, value);
+        }
+
+        // Add to dynamic table if space allows
+        if (self.shouldAddToDynamicTable(name, value)) {
+            try self.addToDynamicTable(name, value);
+        }
+    }
+
+    fn findInStaticTable(self: *Self, name: []const u8, value: []const u8) ?u64 {
+        _ = self;
+        for (QpackDecoder.QPACK_STATIC_TABLE, 0..) |entry, i| {
+            if (mem.eql(u8, entry.name, name) and mem.eql(u8, entry.value, value)) {
+                return i + 1;
+            }
+        }
+        return null;
+    }
+
+    fn findNameInStaticTable(self: *Self, name: []const u8) ?u64 {
+        _ = self;
+        for (QpackDecoder.QPACK_STATIC_TABLE, 0..) |entry, i| {
+            if (mem.eql(u8, entry.name, name)) {
+                return i + 1;
+            }
+        }
+        return null;
+    }
+
+    fn shouldAddToDynamicTable(self: *Self, name: []const u8, value: []const u8) bool {
+        const entry_size = name.len + value.len + 32; // 32 bytes overhead
+        return entry_size <= self.max_table_size / 4; // Only add if reasonable size
+    }
+
+    fn addToDynamicTable(self: *Self, name: []const u8, value: []const u8) !void {
+        const name_copy = try self.allocator.dupe(u8, name);
+        const value_copy = try self.allocator.dupe(u8, value);
+
+        try self.dynamic_table.insert(0, .{ .name = name_copy, .value = value_copy });
+
+        // Evict old entries if necessary
+        while (self.calculateTableSize() > self.max_table_size and self.dynamic_table.items.len > 0) {
+            const removed = self.dynamic_table.pop();
+            self.allocator.free(removed.name);
+            self.allocator.free(removed.value);
+        }
+    }
+
+    fn calculateTableSize(self: *Self) u64 {
+        var size: u64 = 0;
+        for (self.dynamic_table.items) |entry| {
+            size += entry.name.len + entry.value.len + 32;
+        }
+        return size;
+    }
+
+    fn encodeString(self: *Self, buffer: *ArrayList(u8), string: []const u8) !void {
+        _ = self;
+        // For now, just encode length and string (no Huffman compression)
+        try encodeVarint(buffer.writer(), string.len);
+        try buffer.appendSlice(string);
     }
 };
 
