@@ -51,6 +51,8 @@ pub const HttpClientError = error{
     OutOfMemory,
     /// I/O operation failed
     IOError,
+    /// Feature not yet implemented
+    NotImplemented,
 };
 
 /// HTTP server errors
@@ -750,15 +752,14 @@ pub const Client = struct {
             return error.Http3RequiresHttps;
         }
 
-        // Create QUIC connection for HTTP/3
-        var http3_conn = try self.createHttp3Connection(uri_info);
-        defer http3_conn.deinit();
-
-        // Send HTTP/3 request using QPACK headers and HTTP/3 framing
-        const stream_id = try http3_conn.sendRequest(request, uri_info);
-
-        // Read HTTP/3 response
-        return try http3_conn.readResponse(stream_id);
+        // HTTP/3 requires full QUIC transport implementation
+        // TODO: Implement proper HTTP/3 with QUIC transport layer including:
+        // - QUIC connection establishment and handshake
+        // - HTTP/3 framing (HEADERS, DATA, SETTINGS frames)
+        // - QPACK header compression/decompression
+        // - Stream multiplexing and flow control
+        // - Connection migration and 0-RTT support
+        return error.NotImplemented;
     }
 
     /// Convenience methods for common HTTP operations
@@ -1563,94 +1564,6 @@ pub const Client = struct {
         try http2_conn.sendConnectionPreface();
 
         return http2_conn;
-    }
-
-    // HTTP/3 connection placeholder
-    const Http3Connection = struct {
-        allocator: Allocator,
-
-        fn deinit(self: *Http3Connection) void {
-            _ = self;
-        }
-
-        fn sendRequest(self: *Http3Connection, request: *Request, uri_info: UriInfo) !u64 {
-
-            // Create HTTP/3 request headers with QPACK compression
-            var headers = ArrayList(http3.QpackEncoder.QpackEntry).init(self.allocator);
-            defer headers.deinit();
-
-            // Add method header
-            const method_str = switch (request.method) {
-                .get => "GET",
-                .post => "POST",
-                .put => "PUT",
-                .delete => "DELETE",
-                .head => "HEAD",
-                .options => "OPTIONS",
-                .patch => "PATCH",
-            };
-            try headers.append(.{ .name = ":method", .value = method_str });
-
-            // Add scheme (HTTPS for HTTP/3)
-            try headers.append(.{ .name = ":scheme", .value = if (uri_info.port == 443) "https" else "https" });
-
-            // Add authority header
-            const authority = if (uri_info.port == 443)
-                uri_info.host
-            else
-                try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ uri_info.host, uri_info.port });
-            defer if (uri_info.port != 443) self.allocator.free(authority);
-            try headers.append(.{ .name = ":authority", .value = authority });
-
-            // Add path
-            try headers.append(.{ .name = ":path", .value = uri_info.path });
-
-            // Add additional headers
-            var header_iter = request.headers.iter();
-            while (header_iter.next()) |entry| {
-                try headers.append(.{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
-            }
-
-            // Return next available stream ID (client-initiated streams are odd)
-            const stream_id: u64 = 1; // Start with stream ID 1 for first request
-            std.log.debug("HTTP/3 request prepared with {} headers for stream {}", .{ headers.items.len, stream_id });
-            return stream_id;
-        }
-
-        fn readResponse(self: *Http3Connection, stream_id: u64) !Response {
-            std.log.debug("Reading HTTP/3 response for stream {}", .{stream_id});
-
-            // Create a mock response for now - in a real implementation this would:
-            // 1. Read QUIC packets from the transport
-            // 2. Decode HTTP/3 frames (HEADERS, DATA)
-            // 3. Decompress QPACK headers
-            // 4. Reconstruct the HTTP response
-
-            var response = Response.init(self.allocator, .ok);
-
-            // Add some mock headers that would come from QPACK decompression
-            try response.headers.put(":status", "200");
-            try response.headers.put("content-type", "application/json");
-            try response.headers.put("server", "ferret-http3");
-
-            // Mock response body
-            const body = "{}";
-            response.body = try self.allocator.dupe(u8, body);
-
-            std.log.debug("HTTP/3 response read with status {} and {} headers", .{ @intFromEnum(response.status), response.headers.count() });
-
-            return response;
-        }
-    };
-
-    fn createHttp3Connection(self: *Self, uri_info: UriInfo) !Http3Connection {
-        // Initialize HTTP/3 connection with QUIC transport
-        std.log.debug("Creating HTTP/3 QUIC connection to {s}:{d}", .{ uri_info.host, uri_info.port });
-
-        // Create connection with proper QUIC initialization
-        return Http3Connection{
-            .allocator = self.allocator,
-        };
     }
 };
 
