@@ -70,6 +70,8 @@ pub const HttpServerError = error{
     OutOfMemory,
     /// I/O operation failed
     IOError,
+    /// Invalid HTTP request format
+    InvalidRequest,
 };
 
 /// HTTP protocol versions
@@ -1217,8 +1219,8 @@ pub const Server = struct {
             .http_2_0 => .http_2_0,
         };
 
-        // TODO: Parse headers properly (simplified for now)
-        try request.setHeader("Connection", "close"); // Default for now
+        // Parse HTTP headers from the request
+        try parseHttpHeaders(self.allocator, &request, data[0..headers_end.?]);
 
         // Create response object
         var response = Response.init(self.allocator, .ok);
@@ -1484,6 +1486,148 @@ test "HTTP server request handler" {
     // We can't easily test the actual server listening without a full integration test,
     // but we can verify the handler is set
     try testing.expect(server.request_handler != null);
+}
+
+/// Parse HTTP headers from raw request data
+/// Handles header folding, case-insensitive names, and proper value trimming
+fn parseHttpHeaders(allocator: Allocator, request: *Request, data: []const u8) !void {
+    _ = allocator; // Parameter reserved for future use (header folding, etc.)
+    // Find the start of headers (after the request line)
+    const request_line_end = std.mem.indexOf(u8, data, "\r\n") orelse return HttpServerError.InvalidRequest;
+    var pos = request_line_end + 2; // Skip past "\r\n"
+
+    while (pos < data.len) {
+        // Check if we've reached the end of headers
+        if (pos + 1 < data.len and data[pos] == '\r' and data[pos + 1] == '\n') {
+            break; // End of headers
+        }
+
+        // Find end of this header line
+        const line_end = std.mem.indexOfPos(u8, data, pos, "\r\n") orelse break;
+        const line = data[pos..line_end];
+
+        // Handle header folding (lines starting with space or tab are continuations)
+        if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
+            // This is a folded header continuation - for now, skip it
+            // TODO: Implement proper header folding support
+            pos = line_end + 2;
+            continue;
+        }
+
+        // Parse header name and value
+        const colon_pos = std.mem.indexOf(u8, line, ":") orelse {
+            // Invalid header line, skip it
+            pos = line_end + 2;
+            continue;
+        };
+
+        if (colon_pos == 0) {
+            // Empty header name, skip
+            pos = line_end + 2;
+            continue;
+        }
+
+        const header_name = line[0..colon_pos];
+        const header_value_start = colon_pos + 1;
+
+        // Extract and trim header value
+        var header_value = if (header_value_start < line.len)
+            line[header_value_start..]
+        else
+            "";
+
+        // Trim leading and trailing whitespace from value
+        header_value = std.mem.trim(u8, header_value, " \t");
+
+        // Validate header name (RFC 7230: token characters only)
+        if (!isValidHeaderName(header_name)) {
+            pos = line_end + 2;
+            continue;
+        }
+
+        // Store the header (Headers.set handles case-insensitive storage)
+        try request.setHeader(header_name, header_value);
+
+        pos = line_end + 2;
+    }
+}
+
+/// Validate header name according to RFC 7230 token rules
+/// token = 1*tchar
+/// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+///         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+fn isValidHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+
+    for (name) |c| {
+        switch (c) {
+            'a'...'z', 'A'...'Z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+test "HTTP header parsing" {
+    const test_request =
+        "GET /api/users HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "User-Agent: TestAgent/1.0\r\n" ++
+        "Accept: application/json\r\n" ++
+        "Content-Type: application/x-www-form-urlencoded\r\n" ++
+        "Content-Length: 42\r\n" ++
+        "Authorization: Bearer token123\r\n" ++
+        "X-Custom-Header: custom-value\r\n" ++
+        "Cookie: session=abc123; theme=dark\r\n" ++
+        "\r\n" ++
+        "test body content";
+
+    var request = Request.init(testing.allocator, .GET, "/api/users");
+    defer request.deinit();
+
+    try parseHttpHeaders(testing.allocator, &request, test_request);
+
+    // Test that headers were parsed correctly
+    try testing.expectEqualStrings("example.com", request.headers.get("Host").?);
+    try testing.expectEqualStrings("TestAgent/1.0", request.headers.get("User-Agent").?);
+    try testing.expectEqualStrings("application/json", request.headers.get("Accept").?);
+    try testing.expectEqualStrings("application/x-www-form-urlencoded", request.headers.get("Content-Type").?);
+    try testing.expectEqualStrings("42", request.headers.get("Content-Length").?);
+    try testing.expectEqualStrings("Bearer token123", request.headers.get("Authorization").?);
+    try testing.expectEqualStrings("custom-value", request.headers.get("X-Custom-Header").?);
+    try testing.expectEqualStrings("session=abc123; theme=dark", request.headers.get("Cookie").?);
+
+    // Test case-insensitive access
+    try testing.expectEqualStrings("example.com", request.headers.get("host").?);
+    try testing.expectEqualStrings("42", request.headers.get("content-length").?);
+}
+
+test "HTTP header parsing edge cases" {
+    // Test malformed headers, whitespace handling, etc.
+    const test_request =
+        "GET / HTTP/1.1\r\n" ++
+        "Valid-Header: value\r\n" ++
+        "Whitespace-Value:   trimmed   \r\n" ++
+        ": empty-name\r\n" ++ // Invalid: empty header name
+        "No-Colon-Header\r\n" ++ // Invalid: no colon
+        "Invalid@Char: value\r\n" ++ // Invalid: @ not allowed in header name
+        "Valid-Empty: \r\n" ++ // Valid: empty value
+        "\r\n";
+
+    var request = Request.init(testing.allocator, .GET, "/");
+    defer request.deinit();
+
+    try parseHttpHeaders(testing.allocator, &request, test_request);
+
+    // Test that valid headers were parsed
+    try testing.expectEqualStrings("value", request.headers.get("Valid-Header").?);
+    try testing.expectEqualStrings("trimmed", request.headers.get("Whitespace-Value").?);
+    try testing.expectEqualStrings("", request.headers.get("Valid-Empty").?);
+
+    // Test that invalid headers were ignored
+    try testing.expect(request.headers.get("") == null); // Empty name header
+    try testing.expect(request.headers.get("No-Colon-Header") == null);
+    try testing.expect(request.headers.get("Invalid@Char") == null);
 }
 
 test "HTTP server error handling" {
