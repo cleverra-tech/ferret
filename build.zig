@@ -46,449 +46,109 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
 
-    // Integration tests
-    const integration_tests = b.addExecutable(.{
-        .name = "integration_tests",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/integration_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(integration_tests);
+    // Programmatic build configuration
+    const BuildConfig = struct {
+        name: []const u8,
+        file: []const u8,
+        step_name: []const u8,
+        description: []const u8,
+    };
 
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    const integration_test_step = b.step("test-integration", "Run integration tests");
-    integration_test_step.dependOn(&run_integration_tests.step);
+    const benchmarks = [_]BuildConfig{
+        .{ .name = "json_benchmark", .file = "bench/json_benchmark.zig", .step_name = "benchmark-json", .description = "Run JSON benchmark" },
+        .{ .name = "reactor_benchmark", .file = "bench/reactor_benchmark.zig", .step_name = "benchmark-reactor", .description = "Run reactor benchmark" },
+        .{ .name = "crypto_benchmark", .file = "bench/crypto_benchmark.zig", .step_name = "benchmark-crypto", .description = "Run crypto benchmark" },
+        .{ .name = "queue_benchmark", .file = "bench/queue_benchmark.zig", .step_name = "benchmark-queue", .description = "Run Queue performance benchmark" },
+        .{ .name = "buffer_benchmark", .file = "bench/buffer_benchmark.zig", .step_name = "benchmark-buffer", .description = "Run Buffer performance benchmark" },
+        .{ .name = "socket_benchmark", .file = "bench/socket_benchmark.zig", .step_name = "benchmark-socket", .description = "Run Socket performance benchmark" },
+        .{ .name = "atomic_benchmark", .file = "bench/atomic_benchmark.zig", .step_name = "benchmark-atomic", .description = "Run Atomic operations performance benchmark" },
+        .{ .name = "config_benchmark", .file = "bench/config_benchmark.zig", .step_name = "benchmark-config", .description = "Run configuration system performance benchmark" },
+        .{ .name = "websocket_benchmark", .file = "bench/websocket_benchmark.zig", .step_name = "benchmark-websocket", .description = "Run WebSocket connection upgrade and processing benchmark" },
+        .{ .name = "asymmetric_crypto_benchmark", .file = "bench/asymmetric_crypto_benchmark.zig", .step_name = "benchmark-asymmetric-crypto", .description = "Run asymmetric cryptography performance benchmark" },
+        .{ .name = "http3_benchmark", .file = "bench/http3_benchmark.zig", .step_name = "benchmark-http3", .description = "Run HTTP/3 performance benchmark" },
+        .{ .name = "http3_sendrequest_benchmark", .file = "bench/http3_sendrequest_benchmark.zig", .step_name = "benchmark-http3-sendrequest", .description = "Run HTTP/3 sendRequest benchmark" },
+    };
 
-    // JSON benchmark
-    const json_benchmark = b.addExecutable(.{
-        .name = "json_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/json_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(json_benchmark);
+    const tests = [_]BuildConfig{
+        .{ .name = "integration_tests", .file = "tests/integration_tests.zig", .step_name = "test-integration", .description = "Run integration tests" },
+        .{ .name = "http_test", .file = "tests/http_test.zig", .step_name = "test-http", .description = "Run HTTP test" },
+        .{ .name = "unicode_test", .file = "tests/unicode_test.zig", .step_name = "test-unicode", .description = "Run Unicode validation test" },
+        .{ .name = "http_client_test", .file = "tests/http_client_test.zig", .step_name = "test-http-client", .description = "Run HTTP client test and benchmark" },
+        .{ .name = "http_server_test", .file = "tests/http_server_test.zig", .step_name = "test-http-server", .description = "Run HTTP server test and benchmark" },
+    };
 
-    const run_json_benchmark = b.addRunArtifact(json_benchmark);
-    const json_benchmark_step = b.step("benchmark-json", "Run JSON benchmark");
-    json_benchmark_step.dependOn(&run_json_benchmark.step);
+    const examples = [_]BuildConfig{
+        .{ .name = "http3_demo", .file = "examples/http3_demo.zig", .step_name = "demo-http3", .description = "Run HTTP/3 demo" },
+        .{ .name = "config_demo", .file = "examples/config_demo.zig", .step_name = "demo-config", .description = "Run configuration system demo" },
+        .{ .name = "http2_demo", .file = "examples/http2_demo.zig", .step_name = "demo-http2", .description = "Run HTTP/2 demo" },
+        .{ .name = "http_protocols_comparison", .file = "examples/http_protocols_comparison.zig", .step_name = "demo-http-comparison", .description = "Run HTTP protocols comparison demo" },
+        .{ .name = "unified_http_demo", .file = "examples/unified_http_demo.zig", .step_name = "demo-unified-http", .description = "Run unified HTTP API demo" },
+        .{ .name = "data_structures_demo", .file = "examples/data_structures_demo.zig", .step_name = "demo-data-structures", .description = "Run data structures demo" },
+        .{ .name = "simple_http3_demo", .file = "examples/simple_http3_demo.zig", .step_name = "demo-simple-http3", .description = "Run simple HTTP/3 demo" },
+    };
 
-    // Reactor benchmark
-    const reactor_benchmark = b.addExecutable(.{
-        .name = "reactor_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/reactor_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(reactor_benchmark);
+    // Build benchmarks
+    var benchmark_runs: [benchmarks.len]*std.Build.Step.Run = undefined;
+    for (benchmarks, 0..) |config, i| {
+        const bench_exe = b.addExecutable(.{
+            .name = config.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(config.file),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "ferret", .module = ferret_mod },
+                },
+            }),
+        });
+        b.installArtifact(bench_exe);
+        const bench_run_cmd = b.addRunArtifact(bench_exe);
+        benchmark_runs[i] = bench_run_cmd;
+        const step = b.step(config.step_name, config.description);
+        step.dependOn(&bench_run_cmd.step);
+    }
 
-    const run_reactor_benchmark = b.addRunArtifact(reactor_benchmark);
-    const reactor_benchmark_step = b.step("benchmark-reactor", "Run reactor benchmark");
-    reactor_benchmark_step.dependOn(&run_reactor_benchmark.step);
+    // Build tests
+    for (tests) |config| {
+        const test_exe = b.addExecutable(.{
+            .name = config.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(config.file),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "ferret", .module = ferret_mod },
+                },
+            }),
+        });
+        b.installArtifact(test_exe);
+        const test_run_cmd = b.addRunArtifact(test_exe);
+        const step = b.step(config.step_name, config.description);
+        step.dependOn(&test_run_cmd.step);
+    }
 
-    // Crypto benchmark
-    const crypto_benchmark = b.addExecutable(.{
-        .name = "crypto_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/crypto_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(crypto_benchmark);
-
-    const run_crypto_benchmark = b.addRunArtifact(crypto_benchmark);
-    const crypto_benchmark_step = b.step("benchmark-crypto", "Run crypto benchmark");
-    crypto_benchmark_step.dependOn(&run_crypto_benchmark.step);
-
-    // HTTP test
-    const http_test = b.addExecutable(.{
-        .name = "http_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http_test);
-
-    const run_http_test = b.addRunArtifact(http_test);
-    const http_test_step = b.step("test-http", "Run HTTP test");
-    http_test_step.dependOn(&run_http_test.step);
-
-    // HTTP/3 demo
-    const http3_demo = b.addExecutable(.{
-        .name = "http3_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http3_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http3_demo);
-
-    const run_http3_demo = b.addRunArtifact(http3_demo);
-    const http3_demo_step = b.step("demo-http3", "Run HTTP/3 demo");
-    http3_demo_step.dependOn(&run_http3_demo.step);
-
-    // HTTP/3 sendRequest benchmark
-    const http3_sendrequest_benchmark = b.addExecutable(.{
-        .name = "http3_sendrequest_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http3_sendrequest_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http3_sendrequest_benchmark);
-
-    const run_http3_sendrequest_benchmark = b.addRunArtifact(http3_sendrequest_benchmark);
-    const http3_sendrequest_benchmark_step = b.step("benchmark-http3-sendrequest", "Run HTTP/3 sendRequest benchmark");
-    http3_sendrequest_benchmark_step.dependOn(&run_http3_sendrequest_benchmark.step);
-
-    // Configuration demo
-    const config_demo = b.addExecutable(.{
-        .name = "config_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/config_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(config_demo);
-
-    const run_config_demo = b.addRunArtifact(config_demo);
-    const config_demo_step = b.step("demo-config", "Run configuration system demo");
-    config_demo_step.dependOn(&run_config_demo.step);
-
-    // HTTP/2 demo
-    const http2_demo = b.addExecutable(.{
-        .name = "http2_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http2_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http2_demo);
-
-    const run_http2_demo = b.addRunArtifact(http2_demo);
-    const http2_demo_step = b.step("demo-http2", "Run HTTP/2 demo");
-    http2_demo_step.dependOn(&run_http2_demo.step);
-
-    // HTTP protocols comparison demo
-    const http_comparison_demo = b.addExecutable(.{
-        .name = "http_protocols_comparison",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http_protocols_comparison.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http_comparison_demo);
-
-    const run_http_comparison_demo = b.addRunArtifact(http_comparison_demo);
-    const http_comparison_demo_step = b.step("demo-http-comparison", "Run HTTP protocols comparison demo");
-    http_comparison_demo_step.dependOn(&run_http_comparison_demo.step);
-
-    // Unified HTTP demo
-    const unified_http_demo = b.addExecutable(.{
-        .name = "unified_http_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/unified_http_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(unified_http_demo);
-
-    const run_unified_http_demo = b.addRunArtifact(unified_http_demo);
-    const unified_http_demo_step = b.step("demo-unified-http", "Run unified HTTP API demo");
-    unified_http_demo_step.dependOn(&run_unified_http_demo.step);
-
-    // Unicode test
-    const unicode_test = b.addExecutable(.{
-        .name = "unicode_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/unicode_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(unicode_test);
-
-    const run_unicode_test = b.addRunArtifact(unicode_test);
-    const unicode_test_step = b.step("test-unicode", "Run Unicode validation test");
-    unicode_test_step.dependOn(&run_unicode_test.step);
-
-    // Queue benchmark
-    const queue_benchmark = b.addExecutable(.{
-        .name = "queue_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/queue_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(queue_benchmark);
-
-    const run_queue_benchmark = b.addRunArtifact(queue_benchmark);
-    const queue_benchmark_step = b.step("benchmark-queue", "Run Queue performance benchmark");
-    queue_benchmark_step.dependOn(&run_queue_benchmark.step);
-
-    // Buffer benchmark
-    const buffer_benchmark = b.addExecutable(.{
-        .name = "buffer_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/buffer_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(buffer_benchmark);
-
-    const run_buffer_benchmark = b.addRunArtifact(buffer_benchmark);
-    const buffer_benchmark_step = b.step("benchmark-buffer", "Run Buffer performance benchmark");
-    buffer_benchmark_step.dependOn(&run_buffer_benchmark.step);
-
-    // Socket benchmark
-    const socket_benchmark = b.addExecutable(.{
-        .name = "socket_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/socket_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(socket_benchmark);
-
-    const run_socket_benchmark = b.addRunArtifact(socket_benchmark);
-    const socket_benchmark_step = b.step("benchmark-socket", "Run Socket performance benchmark");
-    socket_benchmark_step.dependOn(&run_socket_benchmark.step);
-
-    // Atomic benchmark
-    const atomic_benchmark = b.addExecutable(.{
-        .name = "atomic_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/atomic_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(atomic_benchmark);
-
-    const run_atomic_benchmark = b.addRunArtifact(atomic_benchmark);
-    const atomic_benchmark_step = b.step("benchmark-atomic", "Run Atomic operations performance benchmark");
-    atomic_benchmark_step.dependOn(&run_atomic_benchmark.step);
-
-    // Configuration benchmark
-    const config_benchmark = b.addExecutable(.{
-        .name = "config_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/config_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(config_benchmark);
-
-    const run_config_benchmark = b.addRunArtifact(config_benchmark);
-    const config_benchmark_step = b.step("benchmark-config", "Run configuration system performance benchmark");
-    config_benchmark_step.dependOn(&run_config_benchmark.step);
-
-    // WebSocket benchmark
-    const websocket_benchmark = b.addExecutable(.{
-        .name = "websocket_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/websocket_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(websocket_benchmark);
-
-    const run_websocket_benchmark = b.addRunArtifact(websocket_benchmark);
-    const websocket_benchmark_step = b.step("benchmark-websocket", "Run WebSocket connection upgrade and processing benchmark");
-    websocket_benchmark_step.dependOn(&run_websocket_benchmark.step);
-
-    // Asymmetric crypto benchmark
-    const asymmetric_crypto_benchmark = b.addExecutable(.{
-        .name = "asymmetric_crypto_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/asymmetric_crypto_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(asymmetric_crypto_benchmark);
-
-    const run_asymmetric_crypto_benchmark = b.addRunArtifact(asymmetric_crypto_benchmark);
-    const asymmetric_crypto_benchmark_step = b.step("benchmark-asymmetric-crypto", "Run asymmetric cryptography performance benchmark");
-    asymmetric_crypto_benchmark_step.dependOn(&run_asymmetric_crypto_benchmark.step);
-
-    // Data structures demo
-    const data_structures_demo = b.addExecutable(.{
-        .name = "data_structures_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/data_structures_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(data_structures_demo);
-
-    const run_data_structures_demo = b.addRunArtifact(data_structures_demo);
-    const data_structures_demo_step = b.step("demo-data-structures", "Run data structures demo");
-    data_structures_demo_step.dependOn(&run_data_structures_demo.step);
-
-    // HTTP/3 benchmark
-    const http3_benchmark = b.addExecutable(.{
-        .name = "http3_benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http3_benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http3_benchmark);
-
-    const run_http3_benchmark = b.addRunArtifact(http3_benchmark);
-    const http3_benchmark_step = b.step("benchmark-http3", "Run HTTP/3 performance benchmark");
-    http3_benchmark_step.dependOn(&run_http3_benchmark.step);
-
-    // Simple HTTP/3 demo
-    const simple_http3_demo = b.addExecutable(.{
-        .name = "simple_http3_demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/simple_http3_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(simple_http3_demo);
-
-    const run_simple_http3_demo = b.addRunArtifact(simple_http3_demo);
-    const simple_http3_demo_step = b.step("demo-simple-http3", "Run simple HTTP/3 demo");
-    simple_http3_demo_step.dependOn(&run_simple_http3_demo.step);
-
-    // HTTP client test
-    const http_client_test = b.addExecutable(.{
-        .name = "http_client_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http_client_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http_client_test);
-
-    const run_http_client_test = b.addRunArtifact(http_client_test);
-    const http_client_test_step = b.step("test-http-client", "Run HTTP client test and benchmark");
-    http_client_test_step.dependOn(&run_http_client_test.step);
-
-    // HTTP server test
-    const http_server_test = b.addExecutable(.{
-        .name = "http_server_test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/http_server_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ferret", .module = ferret_mod },
-            },
-        }),
-    });
-    b.installArtifact(http_server_test);
-
-    const run_http_server_test = b.addRunArtifact(http_server_test);
-    const http_server_test_step = b.step("test-http-server", "Run HTTP server test and benchmark");
-    http_server_test_step.dependOn(&run_http_server_test.step);
+    // Build examples
+    for (examples) |config| {
+        const example_exe = b.addExecutable(.{
+            .name = config.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(config.file),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "ferret", .module = ferret_mod },
+                },
+            }),
+        });
+        b.installArtifact(example_exe);
+        const example_run_cmd = b.addRunArtifact(example_exe);
+        const step = b.step(config.step_name, config.description);
+        step.dependOn(&example_run_cmd.step);
+    }
 
     // Combined benchmark step
     const benchmark_step = b.step("benchmark", "Run all benchmarks");
-    benchmark_step.dependOn(&run_json_benchmark.step);
-    benchmark_step.dependOn(&run_reactor_benchmark.step);
-    benchmark_step.dependOn(&run_crypto_benchmark.step);
-    benchmark_step.dependOn(&run_queue_benchmark.step);
-    benchmark_step.dependOn(&run_buffer_benchmark.step);
-    benchmark_step.dependOn(&run_socket_benchmark.step);
-    benchmark_step.dependOn(&run_atomic_benchmark.step);
-    benchmark_step.dependOn(&run_config_benchmark.step);
-    benchmark_step.dependOn(&run_websocket_benchmark.step);
-    benchmark_step.dependOn(&run_asymmetric_crypto_benchmark.step);
-    benchmark_step.dependOn(&run_http3_benchmark.step);
+    for (benchmark_runs) |bench_run_cmd| {
+        benchmark_step.dependOn(&bench_run_cmd.step);
+    }
 }

@@ -90,6 +90,12 @@ src/
 ├── testing/                 # Testing framework and utilities
 │   └── framework.zig        # Custom testing framework for performance testing
 └── main.zig                 # Framework demonstration and examples
+bench/                       # Performance benchmarks
+├── *_benchmark.zig          # Comprehensive performance testing suite
+examples/                    # Usage examples and demonstrations  
+├── *_demo.zig              # Protocol and feature demonstrations
+tests/                       # Testing suite
+├── *_test.zig              # Integration and validation tests
 ```
 
 ### Testing & Benchmarks
@@ -100,16 +106,21 @@ Ferret includes a comprehensive testing suite with performance benchmarks:
 # Run all tests
 zig build test
 
-# Run specific benchmarks  
+# Run comprehensive benchmark suite
+zig build benchmark              # All performance benchmarks
+
+# Individual performance benchmarks
 zig build benchmark-json          # JSON parsing performance
 zig build benchmark-websocket     # WebSocket frame processing
 zig build benchmark-crypto        # Cryptographic function performance
 zig build benchmark-reactor       # I/O event loop performance
+zig build benchmark-atomic        # Lock-free data structure performance  
+zig build benchmark-buffer        # I/O buffer performance testing
+zig build benchmark-http3         # HTTP/3 with QUIC performance
 
-# Run protocol-specific tests
+# Protocol tests
 zig build test-http               # HTTP protocol tests
-zig build demo-http2              # HTTP/2 demonstration
-zig build demo-http3              # HTTP/3 with QUIC demonstration
+zig build test-integration        # Integration tests
 ```
 
 **Current Test Results**: **188/188 tests passing** with comprehensive coverage
@@ -126,22 +137,24 @@ Real-world performance metrics on modern hardware:
 
 ### Examples & Demonstrations
 
-Ferret includes 24 working examples covering all major features:
+Ferret includes comprehensive examples and demonstrations:
 
 ```bash
 # HTTP protocol demonstrations
 zig build demo-http2              # HTTP/2 multiplexing and server push
 zig build demo-http3              # HTTP/3 with QUIC transport  
 zig build demo-unified-http       # Unified API across HTTP versions
+zig build demo-simple-http3       # Simple HTTP/3 usage example
+zig build demo-http-comparison    # Compare HTTP/1.1, HTTP/2, HTTP/3 performance
 
-# Performance benchmarks
-zig build benchmark-crypto        # Cryptographic performance testing
-zig build benchmark-atomic        # Lock-free data structure performance  
-zig build benchmark-buffer        # I/O buffer performance testing
-
-# Data structure examples
+# Data structure and system examples
 zig build demo-data-structures    # Collections and algorithms demonstration
 zig build demo-config             # Configuration system usage
+
+# Additional tests
+zig build test-http-client        # HTTP client test and benchmark
+zig build test-http-server        # HTTP server test and benchmark
+zig build test-unicode            # Unicode validation testing
 ```
 
 ### Roadmap
