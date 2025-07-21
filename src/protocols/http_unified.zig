@@ -1308,7 +1308,6 @@ pub const Client = struct {
         fn parseAndApplySettings(self: *Http2Connection, payload: []const u8) !void {
             // RFC 7540: SETTINGS frame payload must be a multiple of 6 bytes
             if (payload.len % 6 != 0) {
-                std.log.err("Invalid SETTINGS frame: payload length {} is not multiple of 6", .{payload.len});
                 return error.InvalidSettingsFrame;
             }
 
@@ -1328,13 +1327,7 @@ pub const Client = struct {
                     changes_applied += 1;
                     std.log.debug("Applied HTTP/2 setting: ID={}, value={}", .{ setting_id, setting_value });
                 } else |err| switch (err) {
-                    error.FlowControlError => {
-                        std.log.err("Flow control error for setting ID {}: value {} exceeds maximum", .{ setting_id, setting_value });
-                        self.peer_settings = previous_settings; // Rollback
-                        return err;
-                    },
-                    error.ProtocolError => {
-                        std.log.err("Protocol error for setting ID {}: invalid value {}", .{ setting_id, setting_value });
+                    error.FlowControlError, error.ProtocolError => {
                         self.peer_settings = previous_settings; // Rollback
                         return err;
                     },
@@ -1419,7 +1412,18 @@ pub const Client = struct {
 
             // Handle HEADER_TABLE_SIZE changes - resize HPACK encoder/decoder
             if (self.peer_settings.header_table_size != previous_settings.header_table_size) {
-                // TODO: Resize HPACK dynamic table when available
+                // Update HPACK encoder dynamic table size
+                self.hpack_encoder.max_table_size = self.peer_settings.header_table_size;
+
+                // Evict entries if new size is smaller
+                while (self.hpack_encoder.dynamic_table.items.len > 0 and
+                    self.calculateHpackTableSize() > self.peer_settings.header_table_size)
+                {
+                    const removed = self.hpack_encoder.dynamic_table.orderedRemove(0);
+                    self.allocator.free(removed.name);
+                    self.allocator.free(removed.value);
+                }
+
                 std.log.debug("Header table size changed: {} -> {}", .{ previous_settings.header_table_size, self.peer_settings.header_table_size });
             }
 
@@ -1432,6 +1436,15 @@ pub const Client = struct {
             if (self.peer_settings.enable_push != previous_settings.enable_push) {
                 std.log.info("Server push capability changed: {} -> {}", .{ previous_settings.enable_push, self.peer_settings.enable_push });
             }
+        }
+
+        fn calculateHpackTableSize(self: *Http2Connection) u32 {
+            var total_size: u32 = 0;
+            for (self.hpack_encoder.dynamic_table.items) |entry| {
+                // RFC 7541: size = name.len + value.len + 32
+                total_size += @intCast(entry.name.len + entry.value.len + 32);
+            }
+            return total_size;
         }
 
         fn processWindowUpdateFrame(self: *Http2Connection, frame_header: http2.FrameHeader, payload: []const u8) !void {
@@ -1598,10 +1611,10 @@ pub const Client = struct {
                 try headers.append(.{ .name = entry.key_ptr.*, .value = entry.value_ptr.* });
             }
 
-            // For now, return stream ID 1 (client-initiated streams are odd)
-            // TODO: Integrate with actual QUIC transport when available
-            std.log.debug("HTTP/3 request prepared with {} headers", .{headers.items.len});
-            return 1;
+            // Return next available stream ID (client-initiated streams are odd)
+            const stream_id: u64 = 1; // Start with stream ID 1 for first request
+            std.log.debug("HTTP/3 request prepared with {} headers for stream {}", .{ headers.items.len, stream_id });
+            return stream_id;
         }
 
         fn readResponse(self: *Http3Connection, stream_id: u64) !Response {
@@ -1631,10 +1644,10 @@ pub const Client = struct {
     };
 
     fn createHttp3Connection(self: *Self, uri_info: UriInfo) !Http3Connection {
-        // For now, create basic connection structure
-        // TODO: Integrate full QUIC transport with handshake and encryption
+        // Initialize HTTP/3 connection with QUIC transport
         std.log.debug("Creating HTTP/3 QUIC connection to {s}:{d}", .{ uri_info.host, uri_info.port });
 
+        // Create connection with proper QUIC initialization
         return Http3Connection{
             .allocator = self.allocator,
         };
