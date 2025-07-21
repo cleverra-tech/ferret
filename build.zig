@@ -78,11 +78,7 @@ pub fn build(b: *std.Build) void {
     };
 
     const examples = [_]BuildConfig{
-        .{ .name = "http3_demo", .file = "examples/http3_demo.zig", .step_name = "demo-http3", .description = "Run HTTP/3 demo" },
         .{ .name = "config_demo", .file = "examples/config_demo.zig", .step_name = "demo-config", .description = "Run configuration system demo" },
-        .{ .name = "http2_demo", .file = "examples/http2_demo.zig", .step_name = "demo-http2", .description = "Run HTTP/2 demo" },
-        .{ .name = "http_protocols_comparison", .file = "examples/http_protocols_comparison.zig", .step_name = "demo-http-comparison", .description = "Run HTTP protocols comparison demo" },
-        .{ .name = "unified_http_demo", .file = "examples/unified_http_demo.zig", .step_name = "demo-unified-http", .description = "Run unified HTTP API demo" },
         .{ .name = "data_structures_demo", .file = "examples/data_structures_demo.zig", .step_name = "demo-data-structures", .description = "Run data structures demo" },
         .{ .name = "simple_http3_demo", .file = "examples/simple_http3_demo.zig", .step_name = "demo-simple-http3", .description = "Run simple HTTP/3 demo" },
     };

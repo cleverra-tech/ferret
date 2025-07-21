@@ -534,7 +534,7 @@ pub const X25519 = KeyExchange(.x25519);
 /// Ed25519 digital signatures
 pub const Ed25519 = Signature(.ed25519);
 
-/// ECDSA with secp256k1 curve (placeholder for future implementation)
+/// ECDSA with secp256k1 curve - full implementation using Zig's built-in crypto
 pub const EcdsaSecp256k1 = Signature(.ecdsa_secp256k1);
 
 /// High-level key management utilities
