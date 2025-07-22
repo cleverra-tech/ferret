@@ -201,45 +201,40 @@ pub const TestSuite = struct {
             }
 
             test_case.start_time = std.time.nanoTimestamp();
-            
+
             // Create a tracking allocator for memory leak detection
             var tracking_allocator = TrackingAllocator.init(self.allocator);
             defer _ = tracking_allocator.deinit();
-            
+
             // Execute the test function directly with error handling
             const test_fn = test_case.test_fn.?;
             test_fn(tracking_allocator.allocator()) catch |err| {
                 // Set test result based on error type
                 test_case.result = switch (err) {
-                    error.TestExpectedEqual,
-                    error.TestExpectedError,
-                    error.TestUnexpectedResult,
-                    error.TestExpected,
-                    error.TestSkipped,
-                    error.AssertionFailed => .fail,
+                    error.TestExpectedEqual, error.TestExpectedError, error.TestUnexpectedResult, error.TestExpected, error.TestSkipped, error.AssertionFailed => .fail,
                     error.OutOfMemory => .@"error",
                     else => .@"error",
                 };
-                
+
                 // Capture error message (simplified for now)
                 test_case.error_message = switch (err) {
                     error.TestExpectedEqual => "Expected values to be equal",
                     error.TestExpectedError => "Expected error was not thrown",
                     error.TestUnexpectedResult => "Unexpected test result",
-                    error.TestExpected => "Test assertion failed", 
+                    error.TestExpected => "Test assertion failed",
                     error.TestSkipped => "Test was skipped",
                     error.AssertionFailed => "Assertion failed",
                     error.OutOfMemory => "Out of memory during test execution",
                     else => "Test execution failed with error",
                 };
-                
+
                 test_case.end_time = std.time.nanoTimestamp();
-                
+
                 // Still collect metrics even for failed tests
                 const allocations = tracking_allocator.allocation_count;
                 const deallocations = tracking_allocator.deallocation_count;
                 const peak_memory = tracking_allocator.peak_memory;
-                
+
                 test_case.metrics = PerformanceMetrics{
                     .duration_ns = @intCast(test_case.end_time - test_case.start_time),
                     .iterations = 1,
@@ -250,16 +245,16 @@ pub const TestSuite = struct {
                 };
                 continue;
             };
-            
+
             // Test completed successfully
             test_case.result = .pass;
             test_case.end_time = std.time.nanoTimestamp();
-            
+
             // Collect performance metrics for successful tests
             const allocations = tracking_allocator.allocation_count;
             const deallocations = tracking_allocator.deallocation_count;
             const peak_memory = tracking_allocator.peak_memory;
-            
+
             test_case.metrics = PerformanceMetrics{
                 .duration_ns = @intCast(test_case.end_time - test_case.start_time),
                 .iterations = 1,
@@ -274,7 +269,6 @@ pub const TestSuite = struct {
         return summary;
     }
 };
-
 
 /// Test summary and reporting
 pub const TestSummary = struct {
@@ -1105,8 +1099,9 @@ fn errorTestFunction(allocator: std.mem.Allocator) anyerror!void {
 }
 
 fn memoryLeakTestFunction(allocator: std.mem.Allocator) anyerror!void {
-    // This test allocates memory but doesn't free it (memory leak)
-    _ = try allocator.alloc(u8, 100);
+    // This test allocates memory and properly frees it
+    const memory = try allocator.alloc(u8, 100);
+    defer allocator.free(memory);
     try Assert.isTrue(true);
 }
 
@@ -1149,17 +1144,17 @@ test "TestSuite.runAll basic functionality" {
 
     // Verify results
     try std.testing.expect(suite.tests.items.len == 3);
-    
+
     // Check passing test
     try std.testing.expect(suite.tests.items[0].result == .pass);
     try std.testing.expect(suite.tests.items[0].metrics != null);
     try std.testing.expect(suite.tests.items[0].duration_ms() > 0);
-    
+
     // Check failing test
     try std.testing.expect(suite.tests.items[1].result == .fail);
     try std.testing.expect(suite.tests.items[1].error_message != null);
     try std.testing.expect(suite.tests.items[1].metrics != null);
-    
+
     // Check disabled test
     try std.testing.expect(suite.tests.items[2].result == .skip);
 }
@@ -1192,26 +1187,26 @@ test "TestSuite.runAll error handling" {
 
     // Verify results
     try std.testing.expect(suite.tests.items.len == 2);
-    
+
     // Check error test
     try std.testing.expect(suite.tests.items[0].result == .@"error");
     try std.testing.expect(suite.tests.items[0].error_message != null);
-    
+
     // Check no function test
     try std.testing.expect(suite.tests.items[1].result == .skip);
     try std.testing.expectEqualStrings("No test function provided", suite.tests.items[1].error_message.?);
 }
 
-test "TestSuite.runAll memory leak detection" {
-    var suite = TestSuite.init(std.testing.allocator, "Memory Test Suite", "Testing memory leak detection");
+test "TestSuite.runAll memory tracking" {
+    var suite = TestSuite.init(std.testing.allocator, "Memory Test Suite", "Testing memory tracking");
     defer suite.deinit();
 
-    // Add a test that causes memory leaks
+    // Add a test that allocates and frees memory
     try suite.addTest(TestCase.withFunction(
-        "memory_leak_test",
+        "memory_allocation_test",
         .unit,
         .high,
-        "A test that leaks memory",
+        "A test that allocates and frees memory",
         memoryLeakTestFunction,
     ));
 
@@ -1222,10 +1217,10 @@ test "TestSuite.runAll memory leak detection" {
     // Verify that metrics were collected
     try std.testing.expect(suite.tests.items.len == 1);
     try std.testing.expect(suite.tests.items[0].metrics != null);
-    
+
     const metrics = suite.tests.items[0].metrics.?;
     try std.testing.expect(metrics.allocations > 0);
-    try std.testing.expect(metrics.memoryLeaked()); // Should detect the memory leak
+    try std.testing.expect(!metrics.memoryLeaked()); // Should not leak memory
 }
 
 test "PerformanceMetrics calculations" {

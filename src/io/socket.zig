@@ -485,15 +485,17 @@ pub const SocketManager = struct {
                 return;
             }
 
-            // Add to read buffer
+            // Add to read buffer first to ensure data persistence
+            const start_pos = registration.read_buffer.write_pos;
             _ = registration.read_buffer.write(buffer[0..bytes_read]) catch {
                 self.handleError(registration, SocketError.OutOfMemory);
                 return;
             };
 
-            // Call protocol handler
+            // Call protocol handler with persistent buffer data instead of stack buffer
             if (registration.protocol.onData) |on_data| {
-                on_data(Socket{ .uuid = registration.uuid, .manager = self }, buffer[0..bytes_read]);
+                const persistent_data = registration.read_buffer.data[start_pos..registration.read_buffer.write_pos];
+                on_data(Socket{ .uuid = registration.uuid, .manager = self }, persistent_data);
             }
         }
     }
