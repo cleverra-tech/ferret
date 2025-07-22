@@ -562,15 +562,15 @@ pub const HpackDecoder = struct {
                 const available_bits = @min(bits_available, 32);
                 const shift_right = bits_available - available_bits;
                 var top_bits: u32 = @intCast((bit_buffer >> @intCast(shift_right)) & 0xFFFFFFFF);
-                
+
                 // Left-justify the bits to the top 32 positions
                 if (available_bits < 32) {
                     top_bits = top_bits << @intCast(32 - available_bits);
                 }
-                
+
                 // Determine the code length of the current prefix
                 const code_length = huffman_table.CodeLengthOfPrefix(top_bits);
-                
+
                 // Check if we have enough bits for this code
                 if (bits_available < code_length) {
                     break; // Not enough bits for this symbol, wait for more
@@ -583,16 +583,16 @@ pub const HpackDecoder = struct {
 
                 // Decode to canonical symbol
                 const canonical = huffman_table.DecodeToCanonical(code_length, top_bits);
-                
+
                 // Check for EOS symbol (256) - this is an error in HPACK
                 if (canonical == 256) {
                     return error.InvalidHpackData;
                 }
-                
+
                 // Convert canonical to actual symbol
                 const symbol = huffman_table.CanonicalToSource(@intCast(canonical));
                 try out.append(symbol);
-                
+
                 // Consume the decoded bits
                 bits_available -= code_length;
                 bit_buffer &= (@as(u64, 1) << @intCast(bits_available)) - 1; // Clear consumed bits
@@ -615,7 +615,6 @@ pub const HpackDecoder = struct {
         return out.toOwnedSlice();
     }
 };
-
 
 /// HTTP/2 stream states
 pub const StreamState = enum {

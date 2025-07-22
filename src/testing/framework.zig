@@ -115,6 +115,7 @@ pub const TestCase = struct {
     description: []const u8,
     timeout_ms: u32 = 5000,
     enabled: bool = true,
+    test_fn: ?*const fn (std.mem.Allocator) anyerror!void = null,
 
     // Result data
     result: TestResult = .skip,
@@ -126,6 +127,23 @@ pub const TestCase = struct {
     pub fn duration_ms(self: TestCase) f64 {
         if (self.start_time == 0 or self.end_time == 0) return 0;
         return @as(f64, @floatFromInt(self.end_time - self.start_time)) / 1_000_000.0;
+    }
+
+    /// Helper function to create a test case with a test function
+    pub fn withFunction(
+        name: []const u8,
+        category: TestCategory,
+        priority: TestPriority,
+        description: []const u8,
+        test_fn: *const fn (std.mem.Allocator) anyerror!void,
+    ) TestCase {
+        return TestCase{
+            .name = name,
+            .category = category,
+            .priority = priority,
+            .description = description,
+            .test_fn = test_fn,
+        };
     }
 };
 
@@ -175,16 +193,88 @@ pub const TestSuite = struct {
                 continue;
             }
 
+            // Skip tests without test functions
+            if (test_case.test_fn == null) {
+                test_case.result = .skip;
+                test_case.error_message = "No test function provided";
+                continue;
+            }
+
             test_case.start_time = std.time.nanoTimestamp();
-            // Note: Actual test execution would be implemented by the user
-            // This framework provides the infrastructure
+            
+            // Create a tracking allocator for memory leak detection
+            var tracking_allocator = TrackingAllocator.init(self.allocator);
+            defer _ = tracking_allocator.deinit();
+            
+            // Execute the test function directly with error handling
+            const test_fn = test_case.test_fn.?;
+            test_fn(tracking_allocator.allocator()) catch |err| {
+                // Set test result based on error type
+                test_case.result = switch (err) {
+                    error.TestExpectedEqual,
+                    error.TestExpectedError,
+                    error.TestUnexpectedResult,
+                    error.TestExpected,
+                    error.TestSkipped,
+                    error.AssertionFailed => .fail,
+                    error.OutOfMemory => .@"error",
+                    else => .@"error",
+                };
+                
+                // Capture error message (simplified for now)
+                test_case.error_message = switch (err) {
+                    error.TestExpectedEqual => "Expected values to be equal",
+                    error.TestExpectedError => "Expected error was not thrown",
+                    error.TestUnexpectedResult => "Unexpected test result",
+                    error.TestExpected => "Test assertion failed", 
+                    error.TestSkipped => "Test was skipped",
+                    error.AssertionFailed => "Assertion failed",
+                    error.OutOfMemory => "Out of memory during test execution",
+                    else => "Test execution failed with error",
+                };
+                
+                test_case.end_time = std.time.nanoTimestamp();
+                
+                // Still collect metrics even for failed tests
+                const allocations = tracking_allocator.allocation_count;
+                const deallocations = tracking_allocator.deallocation_count;
+                const peak_memory = tracking_allocator.peak_memory;
+                
+                test_case.metrics = PerformanceMetrics{
+                    .duration_ns = @intCast(test_case.end_time - test_case.start_time),
+                    .iterations = 1,
+                    .allocations = allocations,
+                    .deallocations = deallocations,
+                    .peak_memory = peak_memory,
+                    .memory_used = tracking_allocator.total_allocated - tracking_allocator.total_deallocated,
+                };
+                continue;
+            };
+            
+            // Test completed successfully
+            test_case.result = .pass;
             test_case.end_time = std.time.nanoTimestamp();
+            
+            // Collect performance metrics for successful tests
+            const allocations = tracking_allocator.allocation_count;
+            const deallocations = tracking_allocator.deallocation_count;
+            const peak_memory = tracking_allocator.peak_memory;
+            
+            test_case.metrics = PerformanceMetrics{
+                .duration_ns = @intCast(test_case.end_time - test_case.start_time),
+                .iterations = 1,
+                .allocations = allocations,
+                .deallocations = deallocations,
+                .peak_memory = peak_memory,
+                .memory_used = tracking_allocator.total_allocated - tracking_allocator.total_deallocated,
+            };
         }
 
         try summary.addSuite(self);
         return summary;
     }
 };
+
 
 /// Test summary and reporting
 pub const TestSummary = struct {
@@ -993,6 +1083,149 @@ test "Mock functionality" {
     try std.testing.expect(mock.wasCalled());
     try std.testing.expect(mock.wasCalledWith(10));
     try std.testing.expect(mock.call_count == 1);
+}
+
+// Test helper functions
+fn passingTestFunction(allocator: std.mem.Allocator) anyerror!void {
+    _ = allocator;
+    // This test always passes
+    try Assert.isTrue(true);
+}
+
+fn failingTestFunction(allocator: std.mem.Allocator) anyerror!void {
+    _ = allocator;
+    // This test always fails
+    try Assert.isTrue(false);
+}
+
+fn errorTestFunction(allocator: std.mem.Allocator) anyerror!void {
+    _ = allocator;
+    // This test throws an error
+    return error.TestError;
+}
+
+fn memoryLeakTestFunction(allocator: std.mem.Allocator) anyerror!void {
+    // This test allocates memory but doesn't free it (memory leak)
+    _ = try allocator.alloc(u8, 100);
+    try Assert.isTrue(true);
+}
+
+test "TestSuite.runAll basic functionality" {
+    var suite = TestSuite.init(std.testing.allocator, "Test Suite", "Test suite for runAll testing");
+    defer suite.deinit();
+
+    // Add a passing test
+    try suite.addTest(TestCase.withFunction(
+        "passing_test",
+        .unit,
+        .medium,
+        "A test that should pass",
+        passingTestFunction,
+    ));
+
+    // Add a failing test
+    try suite.addTest(TestCase.withFunction(
+        "failing_test",
+        .unit,
+        .medium,
+        "A test that should fail",
+        failingTestFunction,
+    ));
+
+    // Add a disabled test
+    var disabled_test = TestCase.withFunction(
+        "disabled_test",
+        .unit,
+        .low,
+        "A test that is disabled",
+        passingTestFunction,
+    );
+    disabled_test.enabled = false;
+    try suite.addTest(disabled_test);
+
+    // Run all tests
+    var summary = try suite.runAll();
+    defer summary.deinit();
+
+    // Verify results
+    try std.testing.expect(suite.tests.items.len == 3);
+    
+    // Check passing test
+    try std.testing.expect(suite.tests.items[0].result == .pass);
+    try std.testing.expect(suite.tests.items[0].metrics != null);
+    try std.testing.expect(suite.tests.items[0].duration_ms() > 0);
+    
+    // Check failing test
+    try std.testing.expect(suite.tests.items[1].result == .fail);
+    try std.testing.expect(suite.tests.items[1].error_message != null);
+    try std.testing.expect(suite.tests.items[1].metrics != null);
+    
+    // Check disabled test
+    try std.testing.expect(suite.tests.items[2].result == .skip);
+}
+
+test "TestSuite.runAll error handling" {
+    var suite = TestSuite.init(std.testing.allocator, "Error Test Suite", "Testing error handling");
+    defer suite.deinit();
+
+    // Add an error-throwing test
+    try suite.addTest(TestCase.withFunction(
+        "error_test",
+        .unit,
+        .high,
+        "A test that throws an error",
+        errorTestFunction,
+    ));
+
+    // Add a test without a test function
+    const no_function_test = TestCase{
+        .name = "no_function_test",
+        .category = .unit,
+        .priority = .medium,
+        .description = "A test without a function",
+    };
+    try suite.addTest(no_function_test);
+
+    // Run all tests
+    var summary = try suite.runAll();
+    defer summary.deinit();
+
+    // Verify results
+    try std.testing.expect(suite.tests.items.len == 2);
+    
+    // Check error test
+    try std.testing.expect(suite.tests.items[0].result == .@"error");
+    try std.testing.expect(suite.tests.items[0].error_message != null);
+    
+    // Check no function test
+    try std.testing.expect(suite.tests.items[1].result == .skip);
+    try std.testing.expectEqualStrings("No test function provided", suite.tests.items[1].error_message.?);
+}
+
+test "TestSuite.runAll memory leak detection" {
+    var suite = TestSuite.init(std.testing.allocator, "Memory Test Suite", "Testing memory leak detection");
+    defer suite.deinit();
+
+    // Add a test that causes memory leaks
+    try suite.addTest(TestCase.withFunction(
+        "memory_leak_test",
+        .unit,
+        .high,
+        "A test that leaks memory",
+        memoryLeakTestFunction,
+    ));
+
+    // Run all tests
+    var summary = try suite.runAll();
+    defer summary.deinit();
+
+    // Verify that metrics were collected
+    try std.testing.expect(suite.tests.items.len == 1);
+    try std.testing.expect(suite.tests.items[0].metrics != null);
+    
+    const metrics = suite.tests.items[0].metrics.?;
+    try std.testing.expect(metrics.allocations > 0);
+    try std.testing.expect(metrics.memoryLeaked()); // Should detect the memory leak
 }
 
 test "PerformanceMetrics calculations" {
