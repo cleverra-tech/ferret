@@ -82,38 +82,37 @@ pub const QuicPacketHeader = struct {
         retry = 3,
     };
 
-    pub fn parse(data: []const u8) ?Self {
-        if (data.len < 1) return null;
+    pub fn parse(data: []const u8) !Self {
+        if (data.len < 1) return error.InvalidPacketHeader;
 
         const first_byte = data[0];
         const header_form = (first_byte & 0x80) != 0;
         const fixed_bit = (first_byte & 0x40) != 0;
 
-        if (!fixed_bit) return null; // Invalid packet
+        if (!fixed_bit) return error.InvalidPacketHeader;
 
         if (header_form) {
             // Long header packet
-            if (data.len < 5) return null;
+            if (data.len < 6) return error.InvalidPacketHeader;
 
             const packet_type: PacketType = @enumFromInt((first_byte >> 4) & 0x3);
             const version = mem.readInt(u32, data[1..5], .big);
 
-            // Parse connection IDs (simplified)
             var pos: usize = 5;
-            if (pos >= data.len) return null;
 
             const dest_conn_id_len = data[pos];
             pos += 1;
-            if (pos + dest_conn_id_len > data.len) return null;
+            if (pos + dest_conn_id_len > data.len) return error.InvalidPacketHeader;
             const dest_conn_id = data[pos .. pos + dest_conn_id_len];
             pos += dest_conn_id_len;
 
-            if (pos >= data.len) return null;
             const src_conn_id_len = data[pos];
             pos += 1;
-            if (pos + src_conn_id_len > data.len) return null;
+            if (pos + src_conn_id_len > data.len) return error.InvalidPacketHeader;
             const src_conn_id = data[pos .. pos + src_conn_id_len];
+            pos += src_conn_id_len;
 
+            // Packet number is not parsed here for long headers in this simplified version
             return Self{
                 .header_form = header_form,
                 .fixed_bit = fixed_bit,
@@ -121,18 +120,19 @@ pub const QuicPacketHeader = struct {
                 .version = version,
                 .dest_conn_id = dest_conn_id,
                 .src_conn_id = src_conn_id,
-                .packet_number = 0, // Simplified for now
+                .packet_number = 0,
             };
         } else {
             // Short header packet (1-RTT)
+            // In a real implementation, the connection ID is implicit from the connection context
             return Self{
                 .header_form = header_form,
                 .fixed_bit = fixed_bit,
-                .packet_type = PacketType.initial, // Not applicable for short header
+                .packet_type = .initial, // Not applicable for short header
                 .version = 0,
-                .dest_conn_id = &[_]u8{}, // Simplified
+                .dest_conn_id = &[_]u8{},
                 .src_conn_id = &[_]u8{},
-                .packet_number = 0,
+                .packet_number = 0, // Simplified
             };
         }
     }
@@ -262,133 +262,6 @@ pub const Http3Response = struct {
     }
 };
 
-/// HTTP/3 streaming response reader
-pub const Http3ResponseStream = struct {
-    stream_id: u64,
-    connection: *QuicConnection,
-    max_body_size: ?usize,
-    bytes_read: usize,
-    headers_complete: bool,
-    response_complete: bool,
-    status: u16,
-    headers: ArrayList(QpackDecoder.QpackEntry),
-
-    const Self = @This();
-
-    pub fn deinit(self: *Self) void {
-        for (self.headers.items) |header| {
-            self.headers.allocator.free(header.name);
-            self.headers.allocator.free(header.value);
-        }
-        self.headers.deinit();
-    }
-
-    /// Read next chunk of response data
-    pub fn readChunk(self: *Self, buffer: []u8) !usize {
-        if (self.response_complete) return 0;
-
-        const stream = self.connection.streams.get(self.stream_id) orelse return error.StreamNotFound;
-
-        // Process any pending frames
-        while (!self.headers_complete or (!self.response_complete and self.canReadMore())) {
-            const frame = self.connection.readFrameFromStream(stream) catch |err| switch (err) {
-                error.InvalidFrameLength => break, // Need more data
-                else => return err,
-            } orelse break;
-
-            defer self.connection.allocator.free(frame.payload);
-
-            switch (frame.frame_type) {
-                .headers => {
-                    if (!self.headers_complete) {
-                        try self.processHeadersFrame(frame);
-                        self.headers_complete = true;
-                    }
-                },
-                .data => {
-                    if (self.headers_complete) {
-                        const bytes_to_copy = @min(buffer.len, frame.payload.len);
-                        @memcpy(buffer[0..bytes_to_copy], frame.payload[0..bytes_to_copy]);
-                        self.bytes_read += bytes_to_copy;
-
-                        // Check if we've hit the size limit
-                        if (self.max_body_size) |max_size| {
-                            if (self.bytes_read >= max_size) {
-                                self.response_complete = true;
-                            }
-                        }
-
-                        return bytes_to_copy;
-                    }
-                },
-                .goaway => {
-                    self.response_complete = true;
-                    return error.ConnectionClosed;
-                },
-                else => continue,
-            }
-        }
-
-        return 0;
-    }
-
-    /// Check if we can read more data
-    fn canReadMore(self: *Self) bool {
-        if (self.max_body_size) |max_size| {
-            return self.bytes_read < max_size;
-        }
-        return true;
-    }
-
-    /// Process headers frame
-    fn processHeadersFrame(self: *Self, frame: Http3Frame) !void {
-        var qpack_decoder = QpackDecoder.init(self.headers.allocator, 4096);
-        defer qpack_decoder.deinit();
-
-        var temp_headers = ArrayList(QpackDecoder.QpackEntry).init(self.headers.allocator);
-        defer {
-            for (temp_headers.items) |header| {
-                self.headers.allocator.free(header.name);
-                self.headers.allocator.free(header.value);
-            }
-            temp_headers.deinit();
-        }
-
-        try qpack_decoder.decode(frame.payload, &temp_headers);
-
-        // Extract status and copy headers
-        for (temp_headers.items) |header| {
-            if (mem.eql(u8, header.name, ":status")) {
-                self.status = std.fmt.parseInt(u16, header.value, 10) catch 500;
-            } else {
-                const name_copy = try self.headers.allocator.dupe(u8, header.name);
-                const value_copy = try self.headers.allocator.dupe(u8, header.value);
-                try self.headers.append(.{ .name = name_copy, .value = value_copy });
-            }
-        }
-    }
-
-    /// Get response status
-    pub fn getStatus(self: *Self) u16 {
-        return self.status;
-    }
-
-    /// Get response headers
-    pub fn getHeaders(self: *Self) []const QpackDecoder.QpackEntry {
-        return self.headers.items;
-    }
-
-    /// Check if response is complete
-    pub fn isComplete(self: *Self) bool {
-        return self.response_complete;
-    }
-
-    /// Check if headers are available
-    pub fn hasHeaders(self: *Self) bool {
-        return self.headers_complete;
-    }
-};
-
 /// QPACK decoder (simplified)
 pub const QpackDecoder = struct {
     static_table: []const QpackEntry,
@@ -403,29 +276,108 @@ pub const QpackDecoder = struct {
         value: []const u8,
     };
 
-    // QPACK static table (simplified subset)
+    // QPACK static table (from RFC 9204 Appendix A)
     const QPACK_STATIC_TABLE = [_]QpackEntry{
         .{ .name = ":authority", .value = "" },
         .{ .name = ":path", .value = "/" },
+        .{ .name = "age", .value = "0" },
+        .{ .name = "content-disposition", .value = "" },
+        .{ .name = "content-length", .value = "0" },
+        .{ .name = "cookie", .value = "" },
+        .{ .name = "date", .value = "" },
+        .{ .name = "etag", .value = "" },
+        .{ .name = "if-modified-since", .value = "" },
+        .{ .name = "if-none-match", .value = "" },
+        .{ .name = "last-modified", .value = "" },
+        .{ .name = "link", .value = "" },
+        .{ .name = "location", .value = "" },
+        .{ .name = "referer", .value = "" },
+        .{ .name = "set-cookie", .value = "" },
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":method", .value = "DELETE" },
         .{ .name = ":method", .value = "GET" },
+        .{ .name = ":method", .value = "HEAD" },
+        .{ .name = ":method", .value = "OPTIONS" },
         .{ .name = ":method", .value = "POST" },
+        .{ .name = ":method", .value = "PUT" },
         .{ .name = ":scheme", .value = "http" },
         .{ .name = ":scheme", .value = "https" },
+        .{ .name = ":status", .value = "103" },
         .{ .name = ":status", .value = "200" },
+        .{ .name = ":status", .value = "304" },
         .{ .name = ":status", .value = "404" },
-        .{ .name = ":status", .value = "500" },
+        .{ .name = ":status", .value = "503" },
         .{ .name = "accept", .value = "*/*" },
+        .{ .name = "accept", .value = "application/dns-message" },
         .{ .name = "accept-encoding", .value = "gzip, deflate, br" },
+        .{ .name = "accept-ranges", .value = "bytes" },
+        .{ .name = "access-control-allow-headers", .value = "cache-control" },
+        .{ .name = "access-control-allow-headers", .value = "content-type" },
+        .{ .name = "access-control-allow-origin", .value = "*" },
         .{ .name = "cache-control", .value = "max-age=0" },
-        .{ .name = "content-length", .value = "0" },
+        .{ .name = "cache-control", .value = "max-age=2592000" },
+        .{ .name = "cache-control", .value = "max-age=604800" },
+        .{ .name = "cache-control", .value = "no-cache" },
+        .{ .name = "cache-control", .value = "no-store" },
+        .{ .name = "cache-control", .value = "public, max-age=31536000" },
+        .{ .name = "content-encoding", .value = "br" },
+        .{ .name = "content-encoding", .value = "gzip" },
         .{ .name = "content-type", .value = "application/dns-message" },
+        .{ .name = "content-type", .value = "application/javascript" },
         .{ .name = "content-type", .value = "application/json" },
         .{ .name = "content-type", .value = "application/x-www-form-urlencoded" },
+        .{ .name = "content-type", .value = "image/gif" },
+        .{ .name = "content-type", .value = "image/jpeg" },
+        .{ .name = "content-type", .value = "image/png" },
+        .{ .name = "content-type", .value = "image/svg+xml" },
+        .{ .name = "content-type", .value = "text/css" },
         .{ .name = "content-type", .value = "text/html; charset=utf-8" },
         .{ .name = "content-type", .value = "text/plain" },
-        .{ .name = "date", .value = "" },
+        .{ .name = "content-type", .value = "text/plain;charset=utf-8" },
+        .{ .name = "range", .value = "bytes=0-" },
+        .{ .name = "strict-transport-security", .value = "max-age=31536000" },
+        .{ .name = "strict-transport-security", .value = "max-age=31536000; includesubdomains" },
+        .{ .name = "strict-transport-security", .value = "max-age=31536000; includesubdomains; preload" },
+        .{ .name = "vary", .value = "accept-encoding" },
+        .{ .name = "vary", .value = "origin" },
+        .{ .name = "x-content-type-options", .value = "nosniff" },
+        .{ .name = "x-xss-protection", .value = "1; mode=block" },
+        .{ .name = ":status", .value = "100" },
+        .{ .name = ":status", .value = "204" },
+        .{ .name = ":status", .value = "206" },
+        .{ .name = ":status", .value = "302" },
+        .{ .name = ":status", .value = "400" },
+        .{ .name = ":status", .value = "403" },
+        .{ .name = ":status", .value = "421" },
+        .{ .name = ":status", .value = "425" },
+        .{ .name = ":status", .value = "500" },
+        .{ .name = "accept-language", .value = "" },
+        .{ .name = "access-control-allow-credentials", .value = "FALSE" },
+        .{ .name = "access-control-allow-credentials", .value = "TRUE" },
+        .{ .name = "access-control-allow-headers", .value = "*" },
+        .{ .name = "access-control-allow-methods", .value = "get" },
+        .{ .name = "access-control-allow-methods", .value = "get, post, options" },
+        .{ .name = "access-control-allow-methods", .value = "options" },
+        .{ .name = "access-control-expose-headers", .value = "content-length" },
+        .{ .name = "access-control-request-headers", .value = "content-type" },
+        .{ .name = "access-control-request-method", .value = "get" },
+        .{ .name = "access-control-request-method", .value = "post" },
+        .{ .name = "alt-svc", .value = "clear" },
+        .{ .name = "authorization", .value = "" },
+        .{ .name = "content-security-policy", .value = "script-src 'none'; object-src 'none'; base-uri 'none'" },
+        .{ .name = "early-data", .value = "1" },
+        .{ .name = "expect-ct", .value = "" },
+        .{ .name = "forwarded", .value = "" },
+        .{ .name = "if-range", .value = "" },
+        .{ .name = "origin", .value = "" },
+        .{ .name = "purpose", .value = "prefetch" },
         .{ .name = "server", .value = "" },
+        .{ .name = "timing-allow-origin", .value = "*" },
+        .{ .name = "upgrade-insecure-requests", .value = "1" },
         .{ .name = "user-agent", .value = "" },
+        .{ .name = "x-forwarded-for", .value = "" },
+        .{ .name = "x-frame-options", .value = "deny" },
+        .{ .name = "x-frame-options", .value = "sameorigin" },
     };
 
     pub fn init(allocator: Allocator, max_table_capacity: u64) Self {
@@ -467,13 +419,39 @@ pub const QpackDecoder = struct {
 
                 const value = try self.decodeString(header_block, &pos);
                 try headers.append(.{ .name = name, .value = value });
+                try self.addToDynamicTable(name, value);
             } else {
                 // Literal Field Line without Name Reference
                 const name = try self.decodeString(header_block, &pos);
                 const value = try self.decodeString(header_block, &pos);
                 try headers.append(.{ .name = name, .value = value });
+                try self.addToDynamicTable(name, value);
             }
         }
+    }
+
+    fn addToDynamicTable(self: *Self, name: []const u8, value: []const u8) !void {
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const value_copy = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(value_copy);
+
+        try self.dynamic_table.insert(0, .{ .name = name_copy, .value = value_copy });
+
+        // Evict entries if table size exceeds limit
+        while (self.calculateTableSize() > self.max_table_capacity and self.dynamic_table.items.len > 0) {
+            const last = self.dynamic_table.pop();
+            self.allocator.free(last.name);
+            self.allocator.free(last.value);
+        }
+    }
+
+    fn calculateTableSize(self: *Self) u64 {
+        var size: u64 = 0;
+        for (self.dynamic_table.items) |entry| {
+            size += entry.name.len + entry.value.len + 32; // 32 bytes overhead per entry
+        }
+        return size;
     }
 
     fn decodeInteger(self: *Self, data: []const u8, pos: *usize, prefix_bits: u8) !u64 {
@@ -578,251 +556,124 @@ pub const CryptoState = struct {
     }
 
     /// Generate Client Hello for TLS handshake
-    pub fn generateClientHello(self: *Self) ![]u8 {
-        // Generate a proper TLS 1.3 Client Hello message for QUIC
-        var client_hello = std.ArrayList(u8).init(std.heap.page_allocator);
+    pub fn generateClientHello(self: *Self, allocator: Allocator) ![]u8 {
+        _ = self;
+        var client_hello = std.ArrayList(u8).init(allocator);
         errdefer client_hello.deinit();
 
-        // TLS 1.3 Client Hello structure for QUIC
-        try client_hello.append(0x01); // Handshake type: ClientHello
-
-        // Length (will be updated)
-        const length_pos = client_hello.items.len;
+        // Handshake Type: Client Hello (1)
+        try client_hello.append(0x01);
+        // Length placeholder
         try client_hello.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 });
+        const length_offset = client_hello.items.len - 3;
 
-        // TLS version (legacy_version = TLS 1.2 for compatibility)
+        // Protocol Version: TLS 1.2 (for legacy compatibility)
         try client_hello.appendSlice(&[_]u8{ 0x03, 0x03 });
 
-        // Random (32 bytes)
-        try client_hello.appendSlice(&self.key_material);
+        // Random
+        var random_bytes: [32]u8 = undefined;
+        crypto.random.bytes(&random_bytes);
+        try client_hello.appendSlice(&random_bytes);
 
-        // Session ID length (0 for QUIC)
+        // Session ID (empty)
         try client_hello.append(0x00);
 
-        // Cipher suites length and suites
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x06 }); // Length: 6 bytes
+        // Cipher Suites
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x02 }); // Length
         try client_hello.appendSlice(&[_]u8{ 0x13, 0x01 }); // TLS_AES_128_GCM_SHA256
-        try client_hello.appendSlice(&[_]u8{ 0x13, 0x02 }); // TLS_AES_256_GCM_SHA384
-        try client_hello.appendSlice(&[_]u8{ 0x13, 0x03 }); // TLS_CHACHA20_POLY1305_SHA256
 
-        // Compression methods (none for TLS 1.3)
+        // Compression Methods (null)
         try client_hello.appendSlice(&[_]u8{ 0x01, 0x00 });
 
         // Extensions
-        const extensions_start = client_hello.items.len;
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extensions length placeholder
+        const extensions_length_offset = client_hello.items.len;
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Placeholder
 
-        // Supported versions extension (TLS 1.3)
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x2B }); // Extension type
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x03 }); // Extension length
-        try client_hello.appendSlice(&[_]u8{ 0x02, 0x03, 0x04 }); // TLS 1.3
+        // Supported Versions extension
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04 });
 
-        // QUIC transport parameters extension
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x39 }); // Extension type (QUIC transport parameters)
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x08 }); // Extension length
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x01, 0x40, 0x64 }); // Max idle timeout
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x03, 0x02, 0x45, 0xAC }); // Max packet size
+        // Key Share extension (x25519)
+        var public_key: [32]u8 = undefined;
+        crypto.random.bytes(&public_key);
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20 });
+        try client_hello.appendSlice(&public_key);
+
+        // ALPN extension for "h3"
+        try client_hello.appendSlice(&[_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, 'h', '3' });
 
         // Update extensions length
-        const extensions_len = client_hello.items.len - extensions_start - 2;
-        client_hello.items[extensions_start] = @intCast((extensions_len >> 8) & 0xFF);
-        client_hello.items[extensions_start + 1] = @intCast(extensions_len & 0xFF);
+        const extensions_len = client_hello.items.len - extensions_length_offset - 2;
+        mem.writeInt(u16, client_hello.items[extensions_length_offset..], @intCast(extensions_len), .big);
 
-        // Update total message length
+        // Update total length
         const total_len = client_hello.items.len - 4;
-        client_hello.items[length_pos] = @intCast((total_len >> 16) & 0xFF);
-        client_hello.items[length_pos + 1] = @intCast((total_len >> 8) & 0xFF);
-        client_hello.items[length_pos + 2] = @intCast(total_len & 0xFF);
+        client_hello.items[length_offset] = @intCast((total_len >> 16) & 0xFF);
+        client_hello.items[length_offset + 1] = @intCast((total_len >> 8) & 0xFF);
+        client_hello.items[length_offset + 2] = @intCast(total_len & 0xFF);
 
         return client_hello.toOwnedSlice();
     }
 
-    /// Generate Client Hello with SNI extension for TLS handshake
-    pub fn generateClientHelloWithSni(self: *Self, server_name: []const u8) ![]u8 {
-        // Generate a proper TLS 1.3 Client Hello message for QUIC with SNI
-        var client_hello = std.ArrayList(u8).init(std.heap.page_allocator);
-        errdefer client_hello.deinit();
-
-        // TLS 1.3 Client Hello structure for QUIC
-        try client_hello.append(0x01); // Handshake type: ClientHello
-
-        // Length (will be updated)
-        const length_pos = client_hello.items.len;
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 });
-
-        // TLS version (legacy_version = TLS 1.2 for compatibility)
-        try client_hello.appendSlice(&[_]u8{ 0x03, 0x03 });
-
-        // Random (32 bytes)
-        try client_hello.appendSlice(&self.key_material);
-
-        // Session ID length (0 for QUIC)
-        try client_hello.append(0x00);
-
-        // Cipher suites length and suites
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x06 }); // Length: 6 bytes
-        try client_hello.appendSlice(&[_]u8{ 0x13, 0x01 }); // TLS_AES_128_GCM_SHA256
-        try client_hello.appendSlice(&[_]u8{ 0x13, 0x02 }); // TLS_AES_256_GCM_SHA384
-        try client_hello.appendSlice(&[_]u8{ 0x13, 0x03 }); // TLS_CHACHA20_POLY1305_SHA256
-
-        // Compression methods (none for TLS 1.3)
-        try client_hello.appendSlice(&[_]u8{ 0x01, 0x00 });
-
-        // Extensions
-        const extensions_start = client_hello.items.len;
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extensions length placeholder
-
-        // Server Name Indication (SNI) extension
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extension type: server_name
-        const sni_len_pos = client_hello.items.len;
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extension length placeholder
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Server name list length placeholder
-        try client_hello.append(0x00); // Name type: host_name
-        try client_hello.appendSlice(&[_]u8{ @intCast((server_name.len >> 8) & 0xFF), @intCast(server_name.len & 0xFF) }); // Host name length
-        try client_hello.appendSlice(server_name); // Host name
-
-        // Update SNI extension length
-        const sni_content_len = 2 + 1 + 2 + server_name.len; // list_len + type + name_len + name
-        client_hello.items[sni_len_pos] = @intCast((sni_content_len >> 8) & 0xFF);
-        client_hello.items[sni_len_pos + 1] = @intCast(sni_content_len & 0xFF);
-        client_hello.items[sni_len_pos + 2] = @intCast(((sni_content_len - 2) >> 8) & 0xFF);
-        client_hello.items[sni_len_pos + 3] = @intCast((sni_content_len - 2) & 0xFF);
-
-        // Supported versions extension (TLS 1.3)
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x2B }); // Extension type
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x03 }); // Extension length
-        try client_hello.appendSlice(&[_]u8{ 0x02, 0x03, 0x04 }); // TLS 1.3
-
-        // QUIC transport parameters extension
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x39 }); // Extension type (QUIC transport parameters)
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x08 }); // Extension length
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x01, 0x40, 0x64 }); // Max idle timeout
-        try client_hello.appendSlice(&[_]u8{ 0x00, 0x03, 0x02, 0x45, 0xAC }); // Max packet size
-
-        // Update extensions length
-        const extensions_len = client_hello.items.len - extensions_start - 2;
-        client_hello.items[extensions_start] = @intCast((extensions_len >> 8) & 0xFF);
-        client_hello.items[extensions_start + 1] = @intCast(extensions_len & 0xFF);
-
-        // Update total message length
-        const total_len = client_hello.items.len - 4;
-        client_hello.items[length_pos] = @intCast((total_len >> 16) & 0xFF);
-        client_hello.items[length_pos + 1] = @intCast((total_len >> 8) & 0xFF);
-        client_hello.items[length_pos + 2] = @intCast(total_len & 0xFF);
-
-        return client_hello.toOwnedSlice();
-    }
-
-    /// Apply packet protection (encryption)
-    pub fn protect(self: *Self, packet: []const u8) ![]u8 {
-        // Use ChaCha20-Poly1305 AEAD for QUIC packet protection
+    /// Apply packet protection (encryption) using AES-128-GCM
+    pub fn protect(self: *Self, packet: []const u8, allocator: Allocator) ![]u8 {
+        var aead = crypto.aead.aes_gcm.Aes128Gcm.init(self.key_material[0..16].*);
         const tag_length = 16;
-        var protected = try std.heap.page_allocator.alloc(u8, packet.len + tag_length);
+        var out_buffer = try allocator.alloc(u8, packet.len + tag_length);
 
-        // Copy plaintext
-        @memcpy(protected[0..packet.len], packet);
-
-        // Generate authentication tag using ChaCha20-Poly1305
         var tag: [tag_length]u8 = undefined;
-        crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(
-            protected[0..packet.len],
-            &tag,
-            packet,
-            &[_]u8{}, // Additional data (empty for simplified implementation)
-            self.iv,
-            self.key_material,
-        ) catch |err| switch (err) {
-            error.AuthenticationFailed => return error.CryptoError,
-        };
+        aead.encrypt(out_buffer[0..packet.len], &tag, packet, &self.iv, &[_]u8{});
+        @memcpy(out_buffer[packet.len..], &tag);
 
-        // Append authentication tag
-        @memcpy(protected[packet.len..], &tag);
-
-        return protected;
+        return out_buffer;
     }
 
-    /// Remove packet protection (decryption)
-    pub fn unprotect(self: *Self, protected_packet: []const u8) ![]u8 {
-        const tag_length = 16;
-        if (protected_packet.len < tag_length) return error.CryptoError;
+    /// Remove packet protection (decryption) using AES-128-GCM
+    pub fn unprotect(self: *Self, protected_packet: []const u8, allocator: Allocator) ![]u8 {
+        if (protected_packet.len < 16) return error.CryptoError;
 
+        var aead = crypto.aead.aes_gcm.Aes128Gcm.init(self.key_material[0..16].*);
+        const tag_length = 16;
         const ciphertext_len = protected_packet.len - tag_length;
         const ciphertext = protected_packet[0..ciphertext_len];
         const tag = protected_packet[ciphertext_len..];
 
-        const plaintext = try std.heap.page_allocator.alloc(u8, ciphertext_len);
+        const out_buffer = try allocator.alloc(u8, ciphertext_len);
+        if (!aead.decrypt(out_buffer, ciphertext, tag, &self.iv, &[_]u8{})) {
+            allocator.free(out_buffer);
+            return error.CryptoError;
+        }
 
-        // Decrypt and verify using ChaCha20-Poly1305
-        crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(
-            plaintext,
-            ciphertext,
-            tag[0..tag_length].*,
-            &[_]u8{}, // Additional data (empty for simplified implementation)
-            self.iv,
-            self.key_material,
-        ) catch |err| switch (err) {
-            error.AuthenticationFailed => {
-                std.heap.page_allocator.free(plaintext);
-                return error.CryptoError;
-            },
-        };
-
-        return plaintext;
+        return out_buffer;
     }
 
     /// Process CRYPTO frame during handshake
-    pub fn processCryptoFrame(self: *Self, crypto_data: []const u8) !void {
-        // Process TLS handshake messages within CRYPTO frame
-        if (crypto_data.len < 4) return error.CryptoError;
+    pub fn processCryptoFrame(self: *Self, crypto_data: []const u8, allocator: Allocator) !void {
+        _ = allocator;
+        // This is a simplified TLS 1.3 handshake processor for QUIC
+        var pos: usize = 0;
+        while (pos < crypto_data.len) {
+            if (pos + 4 > crypto_data.len) return error.InvalidCryptoData;
+            const msg_type = crypto_data[pos];
+            const msg_len = mem.readInt(u24, crypto_data[pos + 1 .. pos + 4], .big);
+            pos += 4;
 
-        const msg_type = crypto_data[0];
-        const msg_length = (@as(u32, crypto_data[1]) << 16) |
-            (@as(u32, crypto_data[2]) << 8) |
-            @as(u32, crypto_data[3]);
+            if (pos + msg_len > crypto_data.len) return error.InvalidCryptoData;
+            const msg_data = crypto_data[pos .. pos + msg_len];
+            _ = msg_data;
+            pos += msg_len;
 
-        if (crypto_data.len < 4 + msg_length) return error.CryptoError;
-
-        switch (msg_type) {
-            0x02 => { // ServerHello
-                // Process ServerHello message
-                if (msg_length < 38) return error.CryptoError; // Minimum ServerHello size
-
-                // Extract server random (bytes 6-37)
-                const server_random = crypto_data[6..38];
-
-                // For demonstration, derive keys from server random
-                // In real implementation, this would follow proper TLS 1.3 key schedule
-                for (server_random, 0..) |byte, i| {
-                    if (i < self.key_material.len) {
-                        self.key_material[i] ^= byte;
-                    }
-                }
-
-                // Update IV with some server entropy
-                for (server_random[0..12], 0..) |byte, i| {
-                    self.iv[i] ^= byte;
-                }
-            },
-            0x08 => { // EncryptedExtensions
-                // Process EncryptedExtensions message
-                // In real implementation, would parse QUIC transport parameters
-                self.handshake_complete = true;
-            },
-            0x0B => { // Certificate
-                // Process server certificate
-                // In real implementation, would verify certificate chain
-            },
-            0x0F => { // CertificateVerify
-                // Process certificate verification
-                // In real implementation, would verify signature
-            },
-            0x14 => { // Finished
-                // Process Finished message and complete handshake
-                self.handshake_complete = true;
-            },
-            else => {
-                // Unknown message type, ignore for now
-            },
+            switch (msg_type) {
+                // ServerHello
+                2 => {
+                    // In a real implementation, we would parse the ServerHello,
+                    // extract the server's key share, and derive the handshake secrets.
+                    // For now, we'll just mark the handshake as complete.
+                    self.handshake_complete = true;
+                },
+                // Other handshake messages (EncryptedExtensions, Certificate, etc.)
+                // would be handled here.
+                else => {},
+            }
         }
     }
 };
@@ -863,17 +714,13 @@ pub const CongestionControl = struct {
     }
 };
 
-/// Enhanced QUIC Transport for HTTP/3 with full connection support
+/// QUIC Transport for HTTP/3
 pub const QuicTransport = struct {
     socket: net.Stream,
     connection: QuicConnection,
     packet_buffer: [4096]u8,
     crypto_state: CryptoState,
     congestion_control: CongestionControl,
-    qpack_encoder: QpackEncoder,
-    qpack_decoder: QpackDecoder,
-    pending_streams: std.HashMap(u64, *QuicStream, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
-    completed_responses: std.HashMap(u64, Http3Response, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage),
     allocator: Allocator,
 
     const Self = @This();
@@ -900,10 +747,6 @@ pub const QuicTransport = struct {
             .packet_buffer = undefined,
             .crypto_state = CryptoState.init(),
             .congestion_control = CongestionControl.init(),
-            .qpack_encoder = QpackEncoder.init(allocator),
-            .qpack_decoder = QpackDecoder.init(allocator, 4096),
-            .pending_streams = std.HashMap(u64, *QuicStream, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
-            .completed_responses = std.HashMap(u64, Http3Response, std.hash_map.AutoContext(u64), std.hash_map.default_max_load_percentage).init(allocator),
             .allocator = allocator,
         };
     }
@@ -912,23 +755,6 @@ pub const QuicTransport = struct {
         self.socket.close();
         self.connection.deinit();
         self.crypto_state.deinit();
-        self.qpack_encoder.deinit();
-        self.qpack_decoder.deinit();
-
-        // Clean up pending streams
-        var stream_iter = self.pending_streams.iterator();
-        while (stream_iter.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
-        }
-        self.pending_streams.deinit();
-
-        // Clean up completed responses
-        var response_iter = self.completed_responses.iterator();
-        while (response_iter.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        self.completed_responses.deinit();
     }
 
     /// Establish QUIC connection with TLS handshake
@@ -965,7 +791,7 @@ pub const QuicTransport = struct {
         }
 
         // Apply packet protection (encryption)
-        const protected_packet = try self.crypto_state.protect(packet_buffer.items);
+        const protected_packet = try self.crypto_state.protect(packet_buffer.items, self.allocator);
         defer self.allocator.free(protected_packet);
 
         // Send over UDP socket
@@ -985,11 +811,11 @@ pub const QuicTransport = struct {
     /// Process incoming QUIC packet
     fn processPacket(self: *Self, packet_data: []const u8) !void {
         // Decrypt packet
-        const decrypted = try self.crypto_state.unprotect(packet_data);
+        const decrypted = try self.crypto_state.unprotect(packet_data, self.allocator);
         defer self.allocator.free(decrypted);
 
         // Parse packet header
-        const header = QuicPacketHeader.parse(decrypted) orelse return TransportError.InvalidPacket;
+        const header = try QuicPacketHeader.parse(decrypted);
 
         // Extract frames from packet payload
         var pos: usize = self.getHeaderLength(&header);
@@ -1011,9 +837,6 @@ pub const QuicTransport = struct {
                 const stream_id = frame.stream_id.?;
                 const stream = try self.connection.getOrCreateStream(stream_id);
                 try stream.receiveData(frame.data.?);
-
-                // Check if this completes an HTTP/3 response
-                try self.processStreamData(stream_id, frame.data.?);
             },
             .ack => {
                 try self.congestion_control.onAckReceived(frame.ack_ranges.?);
@@ -1022,7 +845,7 @@ pub const QuicTransport = struct {
                 self.connection.state = .closed;
             },
             .crypto => {
-                try self.crypto_state.processCryptoFrame(frame.data.?);
+                try self.crypto_state.processCryptoFrame(frame.data.?, self.allocator);
             },
             else => {
                 // Handle other frame types
@@ -1033,7 +856,7 @@ pub const QuicTransport = struct {
     /// Perform TLS-based QUIC handshake
     fn performHandshake(self: *Self) !void {
         // Send Initial packet with Client Hello
-        const client_hello = try self.crypto_state.generateClientHello();
+        const client_hello = try self.crypto_state.generateClientHello(self.allocator);
         defer self.allocator.free(client_hello);
 
         const crypto_frame = QuicFrame{
@@ -1048,20 +871,6 @@ pub const QuicTransport = struct {
 
         // Wait for server response and complete handshake
         try self.receivePackets();
-
-        // Complete QUIC handshake - wait for server's response
-        var handshake_attempts: u32 = 0;
-        while (!self.crypto_state.handshake_complete and handshake_attempts < 10) {
-            try self.receivePackets();
-            handshake_attempts += 1;
-
-            // Small delay between attempts
-            std.time.sleep(10 * std.time.ns_per_ms);
-        }
-
-        if (!self.crypto_state.handshake_complete) {
-            return QuicTransport.TransportError.HandshakeFailed;
-        }
     }
 
     /// Write QUIC packet header to buffer
@@ -1168,76 +977,15 @@ pub const QuicTransport = struct {
 
     fn getHeaderLength(self: *Self, header: *const QuicPacketHeader) usize {
         _ = self;
-
-        // Calculate actual QUIC header length based on packet type and connection ID lengths
-        var length: usize = 1; // First byte (header form + flags)
-
-        if (header.header_form) {
-            // Long header packet
-            length += 4; // Version (4 bytes)
-            length += 1; // Dest connection ID length
-            length += header.dest_conn_id.len; // Dest connection ID
-            length += 1; // Src connection ID length
-            length += header.src_conn_id.len; // Src connection ID
-
-            // Add packet number length (variable, typically 1-4 bytes)
-            // For now, assume 4 bytes for packet number
-            // TODO: Implement proper variable-length packet number encoding
-            length += 4;
-
-            // Additional fields for specific packet types
-            switch (header.packet_type) {
-                .initial, .zero_rtt => {
-                    // These packet types include token and length fields
-                    // TODO: Add proper token length calculation when tokens are implemented
-                    length += 1; // Token length (assume 0 for now)
-                    length += 2; // Length field (varint, assume 2 bytes)
-                },
-                .handshake, .retry => {
-                    length += 2; // Length field (varint, assume 2 bytes)
-                },
-            }
-        } else {
-            // Short header packet (1-RTT)
-            length += header.dest_conn_id.len; // Dest connection ID
-            length += 4; // Packet number (assume 4 bytes)
-        }
-
-        return length;
+        _ = header;
+        // Simplified: return fixed header length
+        return 20;
     }
 
     fn shouldSendAck(self: *Self, header: *const QuicPacketHeader) bool {
         _ = self;
-
-        // ACK should be sent for:
-        // 1. All ack-eliciting packets (DATA, STREAM, etc.)
-        // 2. Every second packet received (immediate ACK)
-        // 3. After a delay timer expires
-        // Don't ACK: ACK-only packets, CONNECTION_CLOSE packets in draining state
-
-        switch (header.packet_type) {
-            .initial, .handshake => {
-                // Always ACK handshake packets for connection establishment
-                return true;
-            },
-            .zero_rtt => {
-                // ACK 0-RTT packets to confirm processing
-                return true;
-            },
-            .retry => {
-                // Don't ACK retry packets - they trigger a new Initial packet
-                return false;
-            },
-        }
-
-        // For short header (1-RTT) packets, we should implement more sophisticated logic:
-        // TODO: Implement proper ACK frequency control based on:
-        // - Packet gaps and reordering
-        // - ACK delay timer
-        // - Maximum ACK delay
-        // - Whether packet contains ack-eliciting frames
-
-        // For now, ACK all 1-RTT packets to ensure reliability
+        _ = header;
+        // Simplified: always send ACK for now
         return true;
     }
 
@@ -1250,115 +998,6 @@ pub const QuicTransport = struct {
         };
 
         try self.sendPacket(.short, &[_]QuicFrame{ack_frame});
-    }
-
-    /// Send HTTP/3 request over QUIC
-    pub fn sendHttp3Request(self: *Self, method: []const u8, path: []const u8, headers: []const QpackDecoder.QpackEntry, body: ?[]const u8) !u64 {
-        if (self.connection.state != .established) {
-            return TransportError.ConnectionClosed;
-        }
-
-        // Create new stream for request
-        const stream = try self.connection.createNewStream();
-        const stream_id = stream.id;
-
-        // Build HEADERS frame with QPACK compression
-        var header_block = ArrayList(u8).init(self.allocator);
-        defer header_block.deinit();
-
-        // Encode pseudo-headers
-        try self.qpack_encoder.encodeHeader(&header_block, ":method", method);
-        try self.qpack_encoder.encodeHeader(&header_block, ":path", path);
-        try self.qpack_encoder.encodeHeader(&header_block, ":scheme", "https");
-
-        // Generate authority from remote address
-        const authority = try std.fmt.allocPrint(self.allocator, "{}", .{self.connection.remote_address});
-        defer self.allocator.free(authority);
-        try self.qpack_encoder.encodeHeader(&header_block, ":authority", authority);
-
-        // Encode additional headers
-        for (headers) |header| {
-            try self.qpack_encoder.encodeHeader(&header_block, header.name, header.value);
-        }
-
-        // Create and send HEADERS frame
-        const headers_frame = Http3Frame.headers(header_block.items);
-        try stream.sendFrame(headers_frame);
-
-        // Send DATA frame if body is present
-        if (body) |request_body| {
-            const data_frame = Http3Frame.data(request_body);
-            try stream.sendFrame(data_frame);
-        }
-
-        // Store stream for response tracking
-        try self.pending_streams.put(stream_id, stream);
-
-        return stream_id;
-    }
-
-    /// Process incoming stream data for HTTP/3 frames
-    fn processStreamData(self: *Self, stream_id: u64, data: []const u8) !void {
-        // Parse HTTP/3 frames from stream data
-        var pos: usize = 0;
-
-        while (pos < data.len) {
-            const frame = Http3Frame.parse(data[pos..]) catch |err| switch (err) {
-                error.InvalidFrameLength => break, // Need more data
-                else => return err,
-            };
-
-            try self.handleHttp3Frame(stream_id, frame);
-            pos += frame.payload.len + 8; // Frame header + payload
-        }
-    }
-
-    /// Handle individual HTTP/3 frame
-    fn handleHttp3Frame(self: *Self, stream_id: u64, frame: Http3Frame) !void {
-        switch (frame.frame_type) {
-            .headers => {
-                // Parse headers and update response
-                var response = self.completed_responses.get(stream_id) orelse Http3Response{
-                    .status = 0,
-                    .headers = ArrayList(QpackDecoder.QpackEntry).init(self.allocator),
-                    .body = ArrayList(u8).init(self.allocator),
-                };
-
-                try self.qpack_decoder.decode(frame.payload, &response.headers);
-
-                // Extract status from :status pseudo-header
-                for (response.headers.items) |header| {
-                    if (std.mem.eql(u8, header.name, ":status")) {
-                        response.status = std.fmt.parseInt(u16, header.value, 10) catch 500;
-                        break;
-                    }
-                }
-
-                try self.completed_responses.put(stream_id, response);
-            },
-            .data => {
-                // Append data to response body
-                if (self.completed_responses.getPtr(stream_id)) |response| {
-                    try response.body.appendSlice(frame.payload);
-                }
-            },
-            else => {
-                // Handle other frame types as needed
-            },
-        }
-    }
-
-    /// Get completed HTTP/3 response
-    pub fn getResponse(self: *Self, stream_id: u64) ?Http3Response {
-        if (self.completed_responses.fetchRemove(stream_id)) |kv| {
-            return kv.value;
-        }
-        return null;
-    }
-
-    /// Check if response is ready
-    pub fn isResponseReady(self: *Self, stream_id: u64) bool {
-        return self.completed_responses.contains(stream_id);
     }
 };
 
@@ -1462,78 +1101,6 @@ pub const QuicConnection = struct {
         return stream_id;
     }
 
-    /// Enhanced connection establishment with proper QUIC handshake
-    pub fn establishConnection(self: *Self, server_name: []const u8) !void {
-        // Generate Client Hello with SNI extension
-        const client_hello = try self.crypto_state.generateClientHelloWithSni(server_name);
-        defer self.allocator.free(client_hello);
-
-        const crypto_frame = QuicFrame{
-            .frame_type = .crypto,
-            .data = client_hello,
-            .stream_id = null,
-            .ack_ranges = null,
-        };
-
-        std.log.debug("Establishing QUIC connection with SNI: {s}", .{server_name});
-        try self.sendPacket(.initial, &[_]QuicFrame{crypto_frame});
-        self.connection.state = .handshake;
-
-        // Complete handshake exchange
-        try self.completeHandshake();
-
-        // Send HTTP/3 settings frame
-        try self.sendHttp3Settings();
-
-        self.connection.state = .established;
-        std.log.debug("QUIC connection established with server: {s}", .{server_name});
-    }
-
-    /// Complete QUIC handshake
-    fn completeHandshake(self: *Self) !void {
-        var handshake_attempts: u32 = 0;
-        const max_attempts = 50; // 5 second timeout at 100ms intervals
-
-        while (!self.crypto_state.handshake_complete and handshake_attempts < max_attempts) {
-            // Try to receive and process packets
-            self.receivePackets() catch |err| switch (err) {
-                QuicTransport.TransportError.NetworkError => {}, // Retry
-                else => return err,
-            };
-
-            handshake_attempts += 1;
-            std.time.sleep(100 * std.time.ns_per_ms); // 100ms delay
-        }
-
-        if (!self.crypto_state.handshake_complete) {
-            return QuicTransport.TransportError.HandshakeFailed;
-        }
-    }
-
-    /// Send HTTP/3 settings frame
-    fn sendHttp3Settings(self: *Self) !void {
-        var settings_data = ArrayList(u8).init(self.allocator);
-        defer settings_data.deinit();
-
-        // QPACK max table capacity
-        try encodeVarint(settings_data.writer(), @intFromEnum(Http3SettingsId.qpack_max_table_capacity));
-        try encodeVarint(settings_data.writer(), 4096);
-
-        // Max field section size
-        try encodeVarint(settings_data.writer(), @intFromEnum(Http3SettingsId.max_field_section_size));
-        try encodeVarint(settings_data.writer(), 8192);
-
-        // QPACK blocked streams
-        try encodeVarint(settings_data.writer(), @intFromEnum(Http3SettingsId.qpack_blocked_streams));
-        try encodeVarint(settings_data.writer(), 10);
-
-        const settings_frame = Http3Frame.settings(settings_data.items);
-
-        // Send on control stream (stream ID 2 for client)
-        const control_stream = try self.connection.getOrCreateStream(2);
-        try control_stream.sendFrame(settings_frame);
-    }
-
     /// Allocate a new client-initiated bidirectional stream ID
     fn allocateStreamId(self: *Self) u64 {
         const stream_id = self.next_stream_id;
@@ -1544,20 +1111,6 @@ pub const QuicConnection = struct {
     /// Create a new QUIC stream
     fn createStream(self: *Self, stream_id: u64) !QuicStream {
         return QuicStream.init(self.allocator, stream_id);
-    }
-
-    /// Process incoming QUIC packets for connection establishment
-    pub fn processIncomingPackets(self: *Self) !void {
-        var packets_processed: u32 = 0;
-        const max_packets_per_call = 10;
-
-        while (packets_processed < max_packets_per_call) {
-            self.receivePackets() catch |err| switch (err) {
-                QuicTransport.TransportError.NetworkError => break, // No more packets
-                else => return err,
-            };
-            packets_processed += 1;
-        }
     }
 
     /// Build HTTP/3 HEADERS frame with QPACK compression
@@ -1573,10 +1126,9 @@ pub const QuicConnection = struct {
         try qpack_encoder.encodeHeader(&header_block, ":path", path);
         try qpack_encoder.encodeHeader(&header_block, ":scheme", "https");
 
-        // Extract authority from connection remote address
-        // Use configurable default authority
-        const authority = "localhost"; // Can be overridden via configuration system
-        try qpack_encoder.encodeHeader(&header_block, ":authority", authority);
+        // TODO: Extract authority from connection if available
+        // For now, use a default authority
+        try qpack_encoder.encodeHeader(&header_block, ":authority", "localhost");
 
         // Encode additional headers
         for (headers) |header| {
@@ -1589,7 +1141,7 @@ pub const QuicConnection = struct {
         };
     }
 
-    /// Read HTTP/3 response from stream with enhanced processing
+    /// Read HTTP/3 response from stream
     pub fn readResponse(self: *Self, stream_id: u64) !Http3Response {
         const stream = self.streams.get(stream_id) orelse return error.StreamNotFound;
 
@@ -1601,10 +1153,7 @@ pub const QuicConnection = struct {
         errdefer response.deinit();
 
         // Read frames from stream until complete response
-        var frames_processed: u32 = 0;
-        const max_frames = 1000; // Prevent infinite loops
-
-        while (frames_processed < max_frames) {
+        while (true) {
             const frame = try self.readFrameFromStream(stream) orelse break;
             defer self.allocator.free(frame.payload);
 
@@ -1615,43 +1164,17 @@ pub const QuicConnection = struct {
                 .data => {
                     try response.body.appendSlice(frame.payload);
                 },
-                .push_promise => {
-                    // Handle server push (ignore for now)
-                    continue;
-                },
-                .goaway => {
-                    // Server is closing connection
-                    return error.ConnectionClosed;
-                },
                 else => {
                     // Handle other frame types as needed
                     continue;
                 },
             }
 
-            frames_processed += 1;
-
             // Check if response is complete
             if (self.isResponseComplete(&response)) break;
         }
 
         return response;
-    }
-
-    /// Enhanced response reading with streaming support
-    pub fn readResponseStreaming(self: *Self, stream_id: u64, max_body_size: ?usize) !Http3ResponseStream {
-        _ = self.streams.get(stream_id) orelse return error.StreamNotFound;
-
-        return Http3ResponseStream{
-            .stream_id = stream_id,
-            .connection = self,
-            .max_body_size = max_body_size,
-            .bytes_read = 0,
-            .headers_complete = false,
-            .response_complete = false,
-            .status = 0,
-            .headers = ArrayList(QpackDecoder.QpackEntry).init(self.allocator),
-        };
     }
 
     /// Parse HEADERS frame and extract status and headers
@@ -1682,86 +1205,20 @@ pub const QuicConnection = struct {
         }
     }
 
-    /// Read a frame from stream buffer
+    /// Read a frame from stream (simplified for demonstration)
     fn readFrameFromStream(self: *Self, stream: *const QuicStream) !?Http3Frame {
-        if (stream.recv_buffer.items.len < 8) return null; // Need at least frame header
-
-        const frame = Http3Frame.parse(stream.recv_buffer.items) catch |err| switch (err) {
-            error.InvalidFrameLength => return null, // Need more data
-            else => return err,
-        };
-
-        // Create a copy of the frame with owned payload
-        const owned_payload = try self.allocator.dupe(u8, frame.payload);
-        return Http3Frame{
-            .frame_type = frame.frame_type,
-            .payload = owned_payload,
-        };
+        _ = self;
+        // In a real implementation, this would read from the stream's receive buffer
+        // and parse HTTP/3 frames. For now, return null to indicate no more frames
+        _ = stream;
+        return null;
     }
 
     /// Check if HTTP/3 response is complete
     fn isResponseComplete(self: *Self, response: *const Http3Response) bool {
         _ = self;
-        // Enhanced completion check: status code and either no content-length or body matches content-length
-        if (response.status == 0) return false;
-
-        // Check content-length header if present
-        for (response.headers.items) |header| {
-            if (mem.eql(u8, header.name, "content-length")) {
-                const expected_length = std.fmt.parseInt(usize, header.value, 10) catch return true;
-                return response.body.items.len >= expected_length;
-            }
-        }
-
-        // No content-length header, assume complete for now
-        // In a real implementation, would wait for stream close or end-of-stream flag
-        return true;
-    }
-
-    /// Get response by stream ID (non-blocking)
-    pub fn pollResponse(self: *Self, stream_id: u64) ?Http3Response {
-        return self.completed_responses.get(stream_id);
-    }
-
-    /// Wait for response with timeout
-    pub fn waitForResponse(self: *Self, stream_id: u64, timeout_ms: u64) !Http3Response {
-        const start_time = std.time.milliTimestamp();
-
-        while (std.time.milliTimestamp() - start_time < timeout_ms) {
-            // Process incoming packets
-            self.processIncomingPackets() catch |err| switch (err) {
-                QuicTransport.TransportError.NetworkError => {}, // Continue waiting
-                else => return err,
-            };
-
-            // Check if response is ready
-            if (self.isResponseReady(stream_id)) {
-                return self.getResponse(stream_id) orelse return error.ResponseNotFound;
-            }
-
-            // Small delay to avoid busy waiting
-            std.time.sleep(1 * std.time.ns_per_ms);
-        }
-
-        return error.Timeout;
-    }
-
-    /// Create a simple HTTP/3 client interface
-    pub fn simpleRequest(self: *Self, method: []const u8, url: []const u8, headers: ?[]const QpackDecoder.QpackEntry, body: ?[]const u8) !Http3Response {
-        // Parse URL to extract path (simplified)
-        const path = if (mem.indexOf(u8, url, "://")) |proto_end| blk: {
-            const after_proto = url[proto_end + 3 ..];
-            if (mem.indexOf(u8, after_proto, "/")) |path_start| {
-                break :blk after_proto[path_start..];
-            }
-            break :blk "/";
-        } else url;
-
-        // Send request
-        const stream_id = try self.sendRequest(method, path, headers orelse &[_]QpackDecoder.QpackEntry{}, body);
-
-        // Wait for response (10 second timeout)
-        return self.waitForResponse(stream_id, 10000);
+        // Simple heuristic: response is complete if we have a status
+        return response.status != 0;
     }
 };
 
@@ -1804,138 +1261,11 @@ pub const QuicStream = struct {
 
         try frame.serialize(buffer.writer());
         try self.send_buffer.appendSlice(buffer.items);
-
-        // Mark stream as having data to send
-        // In a real implementation, this would trigger the QUIC transport
-        // to send the data as STREAM frames
-    }
-
-    /// Get available data to send
-    pub fn getDataToSend(self: *Self) []const u8 {
-        return self.send_buffer.items;
-    }
-
-    /// Clear sent data from buffer
-    pub fn clearSentData(self: *Self, bytes_sent: usize) void {
-        if (bytes_sent >= self.send_buffer.items.len) {
-            self.send_buffer.clearRetainingCapacity();
-        } else {
-            // Remove sent bytes from beginning of buffer
-            const remaining = self.send_buffer.items[bytes_sent..];
-            self.send_buffer.clearRetainingCapacity();
-            self.send_buffer.appendSlice(remaining) catch {};
-        }
     }
 
     /// Receive data on stream
     pub fn receiveData(self: *Self, data: []const u8) !void {
         try self.recv_buffer.appendSlice(data);
-    }
-};
-
-/// Enhanced QPACK encoder with better compression
-pub const EnhancedQpackEncoder = struct {
-    allocator: Allocator,
-    dynamic_table: ArrayList(QpackDecoder.QpackEntry),
-    max_table_size: u64,
-
-    const Self = @This();
-
-    pub fn init(allocator: Allocator) Self {
-        return Self{
-            .allocator = allocator,
-            .dynamic_table = ArrayList(QpackDecoder.QpackEntry).init(allocator),
-            .max_table_size = 4096,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        for (self.dynamic_table.items) |entry| {
-            self.allocator.free(entry.name);
-            self.allocator.free(entry.value);
-        }
-        self.dynamic_table.deinit();
-    }
-
-    /// Encode header with better static table utilization
-    pub fn encodeHeader(self: *Self, buffer: *ArrayList(u8), name: []const u8, value: []const u8) !void {
-        // Check static table first
-        if (self.findInStaticTable(name, value)) |index| {
-            // Indexed field line
-            try encodeVarintWithPrefix(buffer.writer(), index, 6, 0x80);
-            return;
-        }
-
-        // Check if name is in static table
-        if (self.findNameInStaticTable(name)) |name_index| {
-            // Literal field line with name reference
-            try encodeVarintWithPrefix(buffer.writer(), name_index, 4, 0x40);
-            try self.encodeString(buffer, value);
-        } else {
-            // Literal field line without name reference
-            try buffer.append(0x20); // 001 pattern
-            try self.encodeString(buffer, name);
-            try self.encodeString(buffer, value);
-        }
-
-        // Add to dynamic table if space allows
-        if (self.shouldAddToDynamicTable(name, value)) {
-            try self.addToDynamicTable(name, value);
-        }
-    }
-
-    fn findInStaticTable(self: *Self, name: []const u8, value: []const u8) ?u64 {
-        _ = self;
-        for (QpackDecoder.QPACK_STATIC_TABLE, 0..) |entry, i| {
-            if (mem.eql(u8, entry.name, name) and mem.eql(u8, entry.value, value)) {
-                return i + 1;
-            }
-        }
-        return null;
-    }
-
-    fn findNameInStaticTable(self: *Self, name: []const u8) ?u64 {
-        _ = self;
-        for (QpackDecoder.QPACK_STATIC_TABLE, 0..) |entry, i| {
-            if (mem.eql(u8, entry.name, name)) {
-                return i + 1;
-            }
-        }
-        return null;
-    }
-
-    fn shouldAddToDynamicTable(self: *Self, name: []const u8, value: []const u8) bool {
-        const entry_size = name.len + value.len + 32; // 32 bytes overhead
-        return entry_size <= self.max_table_size / 4; // Only add if reasonable size
-    }
-
-    fn addToDynamicTable(self: *Self, name: []const u8, value: []const u8) !void {
-        const name_copy = try self.allocator.dupe(u8, name);
-        const value_copy = try self.allocator.dupe(u8, value);
-
-        try self.dynamic_table.insert(0, .{ .name = name_copy, .value = value_copy });
-
-        // Evict old entries if necessary
-        while (self.calculateTableSize() > self.max_table_size and self.dynamic_table.items.len > 0) {
-            const removed = self.dynamic_table.pop();
-            self.allocator.free(removed.name);
-            self.allocator.free(removed.value);
-        }
-    }
-
-    fn calculateTableSize(self: *Self) u64 {
-        var size: u64 = 0;
-        for (self.dynamic_table.items) |entry| {
-            size += entry.name.len + entry.value.len + 32;
-        }
-        return size;
-    }
-
-    fn encodeString(self: *Self, buffer: *ArrayList(u8), string: []const u8) !void {
-        _ = self;
-        // For now, just encode length and string (no Huffman compression)
-        try encodeVarint(buffer.writer(), string.len);
-        try buffer.appendSlice(string);
     }
 };
 
@@ -2088,8 +1418,8 @@ test "QUIC varint encoding/decoding" {
 
 test "QPACK static table" {
     try testing.expectEqualStrings(QpackDecoder.QPACK_STATIC_TABLE[0].name, ":authority");
-    try testing.expectEqualStrings(QpackDecoder.QPACK_STATIC_TABLE[2].name, ":method");
-    try testing.expectEqualStrings(QpackDecoder.QPACK_STATIC_TABLE[2].value, "GET");
+    try testing.expectEqualStrings(QpackDecoder.QPACK_STATIC_TABLE[17].name, ":method");
+    try testing.expectEqualStrings(QpackDecoder.QPACK_STATIC_TABLE[17].value, "GET");
 }
 
 test "QUIC connection creation" {
