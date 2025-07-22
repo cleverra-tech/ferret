@@ -161,10 +161,15 @@ pub fn applyMask(data: []u8, mask: [4]u8) void {
 pub const Frame = struct {
     header: FrameHeader,
     payload: []const u8,
+    owns_payload: bool, // Track if we own the payload memory
+    allocator: ?Allocator, // Store allocator for deallocation
 
     /// Create a text frame
-    pub fn text(_: Allocator, data: []const u8, masked: bool) !Self {
+    pub fn text(allocator: Allocator, data: []const u8, masked: bool) !Self {
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, data);
 
         return Self{
             .header = FrameHeader{
@@ -178,13 +183,18 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = data,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
     /// Create a binary frame
-    pub fn binary(_: Allocator, data: []const u8, masked: bool) !Self {
+    pub fn binary(allocator: Allocator, data: []const u8, masked: bool) !Self {
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, data);
 
         return Self{
             .header = FrameHeader{
@@ -198,13 +208,18 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = data,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
     /// Create a ping frame
-    pub fn ping(_: Allocator, data: []const u8, masked: bool) !Self {
+    pub fn ping(allocator: Allocator, data: []const u8, masked: bool) !Self {
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, data);
 
         return Self{
             .header = FrameHeader{
@@ -218,13 +233,18 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = data,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
     /// Create a pong frame
-    pub fn pong(_: Allocator, data: []const u8, masked: bool) !Self {
+    pub fn pong(allocator: Allocator, data: []const u8, masked: bool) !Self {
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, data);
 
         return Self{
             .header = FrameHeader{
@@ -238,7 +258,9 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = data,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
@@ -249,7 +271,7 @@ pub const Frame = struct {
         // Close frame payload: 2-byte status code + optional reason
         var payload = try allocator.alloc(u8, 2 + reason.len);
         mem.writeInt(u16, payload[0..2], @intFromEnum(code), .big);
-        mem.copy(u8, payload[2..], reason);
+        @memcpy(payload[2..], reason);
 
         return Self{
             .header = FrameHeader{
@@ -264,7 +286,39 @@ pub const Frame = struct {
                 .header_size = 0,
             },
             .payload = payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
+    }
+
+    /// Create a frame from parsed data without duplicating payload (for parsing)
+    pub fn fromParsedData(header: FrameHeader, payload: []const u8) Self {
+        return Self{
+            .header = header,
+            .payload = payload,
+            .owns_payload = false,
+            .allocator = null,
+        };
+    }
+
+    /// Create a frame that takes ownership of existing allocated payload
+    pub fn fromOwnedData(allocator: Allocator, header: FrameHeader, payload: []u8) Self {
+        return Self{
+            .header = header,
+            .payload = payload,
+            .owns_payload = true,
+            .allocator = allocator,
+        };
+    }
+
+    /// Deinitialize frame and free owned payload
+    pub fn deinit(self: *Self) void {
+        if (self.owns_payload) {
+            if (self.allocator) |allocator| {
+                allocator.free(@constCast(self.payload));
+            }
+        }
+        self.* = undefined;
     }
 
     /// Check if frame uses compression (RSV1 bit set)
@@ -286,16 +340,16 @@ pub const Frame = struct {
     }
 
     /// Serialize frame to bytes
-    pub fn serialize(self: Self, writer: anytype) !void {
+    pub fn serialize(self: Self, allocator: Allocator, writer: anytype) !void {
         try self.header.serialize(writer);
 
         if (self.header.masked) {
             // Apply masking to payload
             if (self.header.mask_key) |mask| {
-                var masked_payload = try std.heap.page_allocator.alloc(u8, self.payload.len);
-                defer std.heap.page_allocator.free(masked_payload);
+                var masked_payload = try allocator.alloc(u8, self.payload.len);
+                defer allocator.free(masked_payload);
 
-                mem.copy(u8, masked_payload, self.payload);
+                @memcpy(masked_payload, self.payload);
                 applyMask(masked_payload, mask);
                 try writer.writeAll(masked_payload);
             }

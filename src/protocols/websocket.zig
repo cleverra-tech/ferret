@@ -300,13 +300,17 @@ pub const FrameHeader = struct {
 pub const Frame = struct {
     header: FrameHeader,
     payload: []const u8,
+    owns_payload: bool = false, // Track if we own the payload memory
+    allocator: ?Allocator = null, // Store allocator for deallocation
 
     const Self = @This();
 
     /// Create text frame
     pub fn text(allocator: Allocator, data: []const u8, masked: bool) !Self {
-        _ = allocator;
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, data);
 
         return Self{
             .header = FrameHeader{
@@ -320,7 +324,9 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0, // Will be calculated when serializing
             },
-            .payload = data,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
@@ -347,8 +353,10 @@ pub const Frame = struct {
 
     /// Create binary frame
     pub fn binary(allocator: Allocator, data: []const u8, masked: bool) !Self {
-        _ = allocator;
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, data);
 
         return Self{
             .header = FrameHeader{
@@ -362,7 +370,9 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = data,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
@@ -406,13 +416,13 @@ pub const Frame = struct {
 
     /// Create close frame
     pub fn close(allocator: Allocator, code: CloseCode, reason: ?[]const u8, masked: bool) !Self {
-        _ = allocator;
-        _ = code;
         const mask_key = if (masked) generateMaskKey() else null;
+        const reason_bytes = reason orelse "";
 
         // Close frame payload: 2-byte status code + optional reason
-        var payload_len: usize = 2;
-        if (reason) |r| payload_len += r.len;
+        var payload = try allocator.alloc(u8, 2 + reason_bytes.len);
+        mem.writeInt(u16, payload[0..2], @intFromEnum(code), .big);
+        @memcpy(payload[2..], reason_bytes);
 
         return Self{
             .header = FrameHeader{
@@ -422,19 +432,23 @@ pub const Frame = struct {
                 .rsv3 = false,
                 .opcode = .close,
                 .masked = masked,
-                .payload_length = payload_len,
+                .payload_length = payload.len,
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = &[_]u8{}, // Payload will be constructed separately
+            .payload = payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
     /// Create ping frame
     pub fn ping(allocator: Allocator, data: ?[]const u8, masked: bool) !Self {
-        _ = allocator;
         const payload = data orelse &[_]u8{};
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, payload);
 
         return Self{
             .header = FrameHeader{
@@ -448,15 +462,19 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = payload,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
     /// Create pong frame
     pub fn pong(allocator: Allocator, data: ?[]const u8, masked: bool) !Self {
-        _ = allocator;
         const payload = data orelse &[_]u8{};
         const mask_key = if (masked) generateMaskKey() else null;
+
+        // Always duplicate payload to ensure memory safety
+        const owned_payload = try allocator.dupe(u8, payload);
 
         return Self{
             .header = FrameHeader{
@@ -470,7 +488,9 @@ pub const Frame = struct {
                 .mask_key = mask_key,
                 .header_size = 0,
             },
-            .payload = payload,
+            .payload = owned_payload,
+            .owns_payload = true,
+            .allocator = allocator,
         };
     }
 
@@ -489,6 +509,36 @@ pub const Frame = struct {
         }
 
         return result;
+    }
+
+    /// Create a frame from parsed data without duplicating payload (for parsing)
+    pub fn fromParsedData(header: FrameHeader, payload: []const u8) Self {
+        return Self{
+            .header = header,
+            .payload = payload,
+            .owns_payload = false,
+            .allocator = null,
+        };
+    }
+
+    /// Create a frame that takes ownership of existing allocated payload
+    pub fn fromOwnedData(allocator: Allocator, header: FrameHeader, payload: []u8) Self {
+        return Self{
+            .header = header,
+            .payload = payload,
+            .owns_payload = true,
+            .allocator = allocator,
+        };
+    }
+
+    /// Deinitialize frame and free owned payload
+    pub fn deinit(self: *Self) void {
+        if (self.owns_payload) {
+            if (self.allocator) |allocator| {
+                allocator.free(@constCast(self.payload));
+            }
+        }
+        self.* = undefined;
     }
 };
 
@@ -538,10 +588,7 @@ pub const Parser = struct {
                         if (header.payload_length == 0) {
                             // No payload, frame is complete
                             self.state = .frame_complete;
-                            return Frame{
-                                .header = header,
-                                .payload = &[_]u8{},
-                            };
+                            return Frame.fromParsedData(header, &[_]u8{});
                         } else {
                             // Need to read payload
                             self.state = .waiting_for_payload;
@@ -564,27 +611,18 @@ pub const Parser = struct {
 
                     if (self.bytes_needed == 0) {
                         // Payload complete
-                        const payload = try self.payload_buffer.toOwnedSlice();
+                        var payload_owned = try self.payload_buffer.toOwnedSlice();
 
                         // Unmask if necessary
                         if (header.mask_key) |mask| {
-                            // Create a mutable copy for unmasking
-                            const mutable_payload = try self.payload_buffer.allocator.dupe(u8, payload);
-                            defer self.payload_buffer.allocator.free(payload);
-                            maskPayload(mutable_payload, mask);
-
-                            self.state = .frame_complete;
-                            return Frame{
-                                .header = header,
-                                .payload = mutable_payload,
-                            };
+                            // Must use explicit mutation to avoid compiler warning
+                            _ = &payload_owned; // Mark as mutable
+                            maskPayload(payload_owned, mask);
                         }
 
                         self.state = .frame_complete;
-                        return Frame{
-                            .header = header,
-                            .payload = payload,
-                        };
+                        // Create frame that takes ownership of the payload
+                        return Frame.fromOwnedData(self.payload_buffer.allocator, header, payload_owned);
                     }
                 },
                 .frame_complete => {
@@ -765,7 +803,8 @@ pub const Connection = struct {
             return error.ConnectionClosed;
         }
 
-        const frame = try Frame.text(self.allocator, text, !self.is_server);
+        var frame = try Frame.text(self.allocator, text, !self.is_server);
+        defer frame.deinit();
         const serialized = try frame.serialize(self.allocator);
 
         self.messages_sent += 1;
@@ -780,7 +819,8 @@ pub const Connection = struct {
             return error.ConnectionClosed;
         }
 
-        const frame = try Frame.binary(self.allocator, data, !self.is_server);
+        var frame = try Frame.binary(self.allocator, data, !self.is_server);
+        defer frame.deinit();
         const serialized = try frame.serialize(self.allocator);
 
         self.messages_sent += 1;
@@ -795,7 +835,8 @@ pub const Connection = struct {
             return error.ConnectionClosed;
         }
 
-        const frame = try Frame.ping(self.allocator, data, !self.is_server);
+        var frame = try Frame.ping(self.allocator, data, !self.is_server);
+        defer frame.deinit();
         return try frame.serialize(self.allocator);
     }
 
@@ -805,7 +846,8 @@ pub const Connection = struct {
             return error.ConnectionClosed;
         }
 
-        const frame = try Frame.pong(self.allocator, data, !self.is_server);
+        var frame = try Frame.pong(self.allocator, data, !self.is_server);
+        defer frame.deinit();
         return try frame.serialize(self.allocator);
     }
 
@@ -817,23 +859,10 @@ pub const Connection = struct {
 
         self.state = .closing;
 
-        // Create close payload: 2-byte code + optional reason
-        var payload = std.ArrayList(u8).init(self.allocator);
-        defer payload.deinit();
+        var frame = try Frame.close(self.allocator, code, reason, !self.is_server);
+        defer frame.deinit();
 
-        const code_bytes = mem.toBytes(mem.nativeToBig(u16, @intFromEnum(code)));
-        try payload.appendSlice(&code_bytes);
-
-        if (reason) |r| {
-            try payload.appendSlice(r);
-        }
-
-        const frame = try Frame.close(self.allocator, code, reason, !self.is_server);
-        var close_frame = frame;
-        close_frame.payload = payload.items;
-        close_frame.header.payload_length = payload.items.len;
-
-        return try close_frame.serialize(self.allocator);
+        return try frame.serialize(self.allocator);
     }
 
     /// Get connection statistics
@@ -1197,7 +1226,8 @@ test "WebSocket frame header parsing - masked" {
 }
 
 test "WebSocket frame creation" {
-    const text_frame = try Frame.text(testing.allocator, "hello", false);
+    var text_frame = try Frame.text(testing.allocator, "hello", false);
+    defer text_frame.deinit();
     try testing.expect(text_frame.header.opcode == .text);
     try testing.expect(text_frame.header.fin == true);
     try testing.expect(text_frame.header.masked == false);
@@ -1215,7 +1245,8 @@ test "WebSocket handshake key generation" {
 }
 
 test "WebSocket frame serialization" {
-    const frame = try Frame.text(testing.allocator, "hello", false);
+    var frame = try Frame.text(testing.allocator, "hello", false);
+    defer frame.deinit();
     const serialized = try frame.serialize(testing.allocator);
     defer testing.allocator.free(serialized);
 
@@ -1288,7 +1319,8 @@ test "WebSocket connection - message handling" {
     connection.state = .connected;
 
     // Create test text message frame
-    const text_frame = try Frame.text(testing.allocator, "Hello WebSocket!", false);
+    var text_frame = try Frame.text(testing.allocator, "Hello WebSocket!", false);
+    defer text_frame.deinit();
     const serialized = try text_frame.serialize(testing.allocator);
     defer testing.allocator.free(serialized);
 
@@ -1594,6 +1626,7 @@ test "WebSocket compression - frame decompression when not compressed" {
 
     const original_data = "Uncompressed message";
     var frame = try Frame.text(testing.allocator, original_data, false);
+    defer frame.deinit();
 
     try testing.expect(!frame.isCompressed()); // RSV1 should be false
 
