@@ -550,6 +550,8 @@ pub const Response = struct {
     version: HttpVersion,
     headers: Headers,
     body: ?[]const u8,
+    allocator: Allocator,
+    body_owned: bool,
 
     const Self = @This();
 
@@ -559,11 +561,16 @@ pub const Response = struct {
             .version = .http_3_0, // Default to HTTP/3
             .headers = Headers.init(allocator),
             .body = null,
+            .allocator = allocator,
+            .body_owned = false,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
+        if (self.body_owned and self.body != null) {
+            self.allocator.free(self.body.?);
+        }
     }
 
     pub fn setHeader(self: *Self, key: []const u8, value: []const u8) !void {
@@ -752,14 +759,127 @@ pub const Client = struct {
             return error.Http3RequiresHttps;
         }
 
-        // HTTP/3 requires full QUIC transport implementation
-        // TODO: Implement proper HTTP/3 with QUIC transport layer including:
-        // - QUIC connection establishment and handshake
-        // - HTTP/3 framing (HEADERS, DATA, SETTINGS frames)
-        // - QPACK header compression/decompression
-        // - Stream multiplexing and flow control
-        // - Connection migration and 0-RTT support
-        return error.NotImplemented;
+        // Create QUIC transport connection
+        const local_addr = try net.Address.parseIp4("0.0.0.0", 0);
+        const remote_addr = try net.Address.resolveIp(uri_info.host, uri_info.port);
+        
+        var quic_transport = try http3.QuicTransport.init(self.allocator, local_addr, remote_addr);
+        defer quic_transport.deinit();
+
+        // Establish QUIC connection with TLS handshake
+        try quic_transport.connect();
+
+        // Convert HTTP headers to QPACK format
+        var qpack_headers = try self.convertHeadersToQpack(request, uri_info);
+        defer self.deallocateQpackHeaders(&qpack_headers);
+
+        // Send HTTP/3 request
+        const stream_id = try quic_transport.connection.sendRequest(
+            request.method.toString(),
+            uri_info.path,
+            qpack_headers.items,
+            request.body
+        );
+
+        // Read HTTP/3 response
+        var http3_response = try quic_transport.connection.readResponse(stream_id);
+        defer http3_response.deinit();
+
+        // Convert HTTP/3 response to unified response format
+        return try self.convertHttp3Response(http3_response);
+    }
+
+    /// Convert HTTP request headers to QPACK format for HTTP/3
+    fn convertHeadersToQpack(self: *Self, request: *Request, uri_info: UriInfo) !std.ArrayList(http3.QpackDecoder.QpackEntry) {
+        var qpack_headers = std.ArrayList(http3.QpackDecoder.QpackEntry).init(self.allocator);
+        errdefer self.deallocateQpackHeaders(&qpack_headers);
+
+        // Add mandatory pseudo-headers for HTTP/3
+        try qpack_headers.append(http3.QpackDecoder.QpackEntry{
+            .name = try self.allocator.dupe(u8, ":method"),
+            .value = try self.allocator.dupe(u8, request.method.toString()),
+        });
+
+        try qpack_headers.append(http3.QpackDecoder.QpackEntry{
+            .name = try self.allocator.dupe(u8, ":path"),
+            .value = try self.allocator.dupe(u8, uri_info.path),
+        });
+
+        try qpack_headers.append(http3.QpackDecoder.QpackEntry{
+            .name = try self.allocator.dupe(u8, ":scheme"),
+            .value = try self.allocator.dupe(u8, uri_info.scheme),
+        });
+
+        try qpack_headers.append(http3.QpackDecoder.QpackEntry{
+            .name = try self.allocator.dupe(u8, ":authority"),
+            .value = try self.allocator.dupe(u8, uri_info.host),
+        });
+
+        // Convert regular headers
+        var iterator = request.headers.iter();
+        while (iterator.next()) |header| {
+            // Convert header name to lowercase for HTTP/3 compatibility
+            var lowercase_name = try self.allocator.alloc(u8, header.key_ptr.*.len);
+            for (header.key_ptr.*, 0..) |c, i| {
+                lowercase_name[i] = std.ascii.toLower(c);
+            }
+
+            try qpack_headers.append(http3.QpackDecoder.QpackEntry{
+                .name = lowercase_name,
+                .value = try self.allocator.dupe(u8, header.value_ptr.*),
+            });
+        }
+
+        // Add content-length if body is present
+        if (request.body) |body| {
+            const content_length_str = try std.fmt.allocPrint(self.allocator, "{d}", .{body.len});
+            try qpack_headers.append(http3.QpackDecoder.QpackEntry{
+                .name = try self.allocator.dupe(u8, "content-length"),
+                .value = content_length_str,
+            });
+        }
+
+        return qpack_headers;
+    }
+
+    /// Deallocate QPACK headers 
+    fn deallocateQpackHeaders(self: *Self, headers: *std.ArrayList(http3.QpackDecoder.QpackEntry)) void {
+        for (headers.items) |header| {
+            self.allocator.free(header.name);
+            self.allocator.free(header.value);
+        }
+        headers.deinit();
+    }
+
+    /// Convert HTTP/3 response to unified response format
+    fn convertHttp3Response(self: *Self, http3_response: http3.Http3Response) !Response {
+        var response = Response.init(self.allocator, .ok);
+        
+        // Extract status code from pseudo-header or use default
+        response.status = if (http3_response.status > 0) 
+            @enumFromInt(http3_response.status) 
+        else 
+            .ok;
+
+        response.version = .http_3_0;
+
+        // Convert headers from QPACK format
+        for (http3_response.headers.items) |qpack_header| {
+            // Skip pseudo-headers (they start with ':')
+            if (qpack_header.name.len > 0 and qpack_header.name[0] == ':') {
+                continue;
+            }
+
+            try response.headers.set(qpack_header.name, qpack_header.value);
+        }
+
+        // Set response body
+        if (http3_response.body.items.len > 0) {
+            response.body = try self.allocator.dupe(u8, http3_response.body.items);
+            response.body_owned = true;
+        }
+
+        return response;
     }
 
     /// Convenience methods for common HTTP operations
@@ -2570,4 +2690,178 @@ test "HTTP/2 Settings parsing - window size updates" {
     var stream_cleanup = http2_conn.streams.getPtr(stream_id).?;
     stream_cleanup.response_headers.deinit();
     stream_cleanup.response_data.deinit();
+}
+
+test "HTTP/3 QPACK header conversion" {
+    var client = Client.init(testing.allocator);
+    defer client.deinit();
+
+    var request = Request.init(testing.allocator, .GET, "https://example.com/test?param=value");
+    defer request.deinit();
+
+    try request.setHeader("User-Agent", "Ferret/1.0");
+    try request.setHeader("Accept", "application/json");
+    request.setBody("test body");
+
+    const uri_info = try client.parseUri("https://example.com/test?param=value");
+    defer testing.allocator.free(uri_info.host);
+    defer testing.allocator.free(uri_info.path);
+
+    var qpack_headers = try client.convertHeadersToQpack(&request, uri_info);
+    defer client.deallocateQpackHeaders(&qpack_headers);
+
+    // Verify pseudo-headers are present
+    var has_method = false;
+    var has_path = false;
+    var has_scheme = false;
+    var has_authority = false;
+    var has_user_agent = false;
+    var has_accept = false;
+    var has_content_length = false;
+
+    for (qpack_headers.items) |header| {
+        if (mem.eql(u8, header.name, ":method")) {
+            try testing.expectEqualStrings("GET", header.value);
+            has_method = true;
+        } else if (mem.eql(u8, header.name, ":path")) {
+            try testing.expectEqualStrings("/test?param=value", header.value);
+            has_path = true;
+        } else if (mem.eql(u8, header.name, ":scheme")) {
+            try testing.expectEqualStrings("https", header.value);
+            has_scheme = true;
+        } else if (mem.eql(u8, header.name, ":authority")) {
+            try testing.expectEqualStrings("example.com", header.value);
+            has_authority = true;
+        } else if (mem.eql(u8, header.name, "user-agent")) {
+            try testing.expectEqualStrings("Ferret/1.0", header.value);
+            has_user_agent = true;
+        } else if (mem.eql(u8, header.name, "accept")) {
+            try testing.expectEqualStrings("application/json", header.value);
+            has_accept = true;
+        } else if (mem.eql(u8, header.name, "content-length")) {
+            try testing.expectEqualStrings("9", header.value);
+            has_content_length = true;
+        }
+    }
+
+    try testing.expect(has_method);
+    try testing.expect(has_path);
+    try testing.expect(has_scheme);
+    try testing.expect(has_authority);
+    try testing.expect(has_user_agent);
+    try testing.expect(has_accept);
+    try testing.expect(has_content_length);
+}
+
+test "HTTP/3 response conversion" {
+    var client = Client.init(testing.allocator);
+    defer client.deinit();
+
+    // Create a mock HTTP/3 response
+    var http3_response = http3.Http3Response{
+        .status = 200,
+        .headers = std.ArrayList(http3.QpackDecoder.QpackEntry).init(testing.allocator),
+        .body = std.ArrayList(u8).init(testing.allocator),
+    };
+    defer http3_response.deinit();
+
+    // Add some mock headers
+    try http3_response.headers.append(http3.QpackDecoder.QpackEntry{
+        .name = try testing.allocator.dupe(u8, ":status"),
+        .value = try testing.allocator.dupe(u8, "200"),
+    });
+    try http3_response.headers.append(http3.QpackDecoder.QpackEntry{
+        .name = try testing.allocator.dupe(u8, "content-type"),
+        .value = try testing.allocator.dupe(u8, "application/json"),
+    });
+    try http3_response.headers.append(http3.QpackDecoder.QpackEntry{
+        .name = try testing.allocator.dupe(u8, "server"),
+        .value = try testing.allocator.dupe(u8, "nginx/1.20"),
+    });
+
+    // Add body content
+    try http3_response.body.appendSlice("Hello, HTTP/3!");
+
+    // Convert to unified response
+    var response = try client.convertHttp3Response(http3_response);
+    defer response.deinit();
+
+    try testing.expect(response.status == .ok);
+    try testing.expect(response.version == .http_3_0);
+    try testing.expectEqualStrings(response.headers.get("content-type").?, "application/json");
+    try testing.expectEqualStrings(response.headers.get("server").?, "nginx/1.20");
+    try testing.expectEqualStrings(response.body.?, "Hello, HTTP/3!");
+}
+
+test "HTTP/3 URI requirements" {
+    var client = Client.init(testing.allocator);
+    defer client.deinit();
+
+    // Test that HTTP URLs are rejected for HTTP/3
+    var http_request = Request.init(testing.allocator, .GET, "http://example.com/");
+    defer http_request.deinit();
+    http_request.version = .http_3_0;
+
+    try testing.expectError(HttpClientError.Http3RequiresHttps, client.sendHttp3(&http_request));
+
+    // Test that HTTPS URLs are accepted (would fail later at connection level)
+    var https_request = Request.init(testing.allocator, .GET, "https://example.com/");
+    defer https_request.deinit();
+    https_request.version = .http_3_0;
+
+    // This will fail at the network level since we can't actually connect,
+    // but it should pass the HTTPS requirement check
+    const result = client.sendHttp3(&https_request);
+    try testing.expect(result != HttpClientError.Http3RequiresHttps);
+}
+
+test "HTTP/3 header name case conversion" {
+    var client = Client.init(testing.allocator);
+    defer client.deinit();
+
+    var request = Request.init(testing.allocator, .POST, "https://api.example.com/data");
+    defer request.deinit();
+
+    // Add headers with mixed case
+    try request.setHeader("Content-Type", "application/json");
+    try request.setHeader("X-API-Key", "secret123");
+    try request.setHeader("USER-AGENT", "Ferret/1.0");
+
+    const uri_info = try client.parseUri("https://api.example.com/data");
+    defer testing.allocator.free(uri_info.host);
+    defer testing.allocator.free(uri_info.path);
+
+    var qpack_headers = try client.convertHeadersToQpack(&request, uri_info);
+    defer client.deallocateQpackHeaders(&qpack_headers);
+
+    // Verify all header names are lowercase (except pseudo-headers)
+    for (qpack_headers.items) |header| {
+        if (header.name[0] != ':') { // Skip pseudo-headers
+            for (header.name) |c| {
+                try testing.expect(c == std.ascii.toLower(c));
+            }
+        }
+    }
+
+    // Verify specific headers were converted
+    var found_content_type = false;
+    var found_api_key = false;
+    var found_user_agent = false;
+
+    for (qpack_headers.items) |header| {
+        if (mem.eql(u8, header.name, "content-type")) {
+            try testing.expectEqualStrings("application/json", header.value);
+            found_content_type = true;
+        } else if (mem.eql(u8, header.name, "x-api-key")) {
+            try testing.expectEqualStrings("secret123", header.value);
+            found_api_key = true;
+        } else if (mem.eql(u8, header.name, "user-agent")) {
+            try testing.expectEqualStrings("Ferret/1.0", header.value);
+            found_user_agent = true;
+        }
+    }
+
+    try testing.expect(found_content_type);
+    try testing.expect(found_api_key);
+    try testing.expect(found_user_agent);
 }

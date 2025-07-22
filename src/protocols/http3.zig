@@ -440,9 +440,10 @@ pub const QpackDecoder = struct {
 
         // Evict entries if table size exceeds limit
         while (self.calculateTableSize() > self.max_table_capacity and self.dynamic_table.items.len > 0) {
-            const last = self.dynamic_table.pop();
-            self.allocator.free(last.name);
-            self.allocator.free(last.value);
+            if (self.dynamic_table.pop()) |last| {
+                self.allocator.free(last.name);
+                self.allocator.free(last.value);
+            }
         }
     }
 
@@ -603,7 +604,7 @@ pub const CryptoState = struct {
 
         // Update extensions length
         const extensions_len = client_hello.items.len - extensions_length_offset - 2;
-        mem.writeInt(u16, client_hello.items[extensions_length_offset..], @intCast(extensions_len), .big);
+        mem.writeInt(u16, client_hello.items[extensions_length_offset..extensions_length_offset+2][0..2], @intCast(extensions_len), .big);
 
         // Update total length
         const total_len = client_hello.items.len - 4;
@@ -616,12 +617,11 @@ pub const CryptoState = struct {
 
     /// Apply packet protection (encryption) using AES-128-GCM
     pub fn protect(self: *Self, packet: []const u8, allocator: Allocator) ![]u8 {
-        var aead = crypto.aead.aes_gcm.Aes128Gcm.init(self.key_material[0..16].*);
         const tag_length = 16;
         var out_buffer = try allocator.alloc(u8, packet.len + tag_length);
 
         var tag: [tag_length]u8 = undefined;
-        aead.encrypt(out_buffer[0..packet.len], &tag, packet, &self.iv, &[_]u8{});
+        crypto.aead.aes_gcm.Aes128Gcm.encrypt(out_buffer[0..packet.len], &tag, packet, &[_]u8{}, self.iv, self.key_material[0..16].*);
         @memcpy(out_buffer[packet.len..], &tag);
 
         return out_buffer;
@@ -631,17 +631,16 @@ pub const CryptoState = struct {
     pub fn unprotect(self: *Self, protected_packet: []const u8, allocator: Allocator) ![]u8 {
         if (protected_packet.len < 16) return error.CryptoError;
 
-        var aead = crypto.aead.aes_gcm.Aes128Gcm.init(self.key_material[0..16].*);
         const tag_length = 16;
         const ciphertext_len = protected_packet.len - tag_length;
         const ciphertext = protected_packet[0..ciphertext_len];
-        const tag = protected_packet[ciphertext_len..];
+        const tag = protected_packet[ciphertext_len..][0..tag_length].*;
 
         const out_buffer = try allocator.alloc(u8, ciphertext_len);
-        if (!aead.decrypt(out_buffer, ciphertext, tag, &self.iv, &[_]u8{})) {
+        crypto.aead.aes_gcm.Aes128Gcm.decrypt(out_buffer, ciphertext, tag, &[_]u8{}, self.iv, self.key_material[0..16].*) catch {
             allocator.free(out_buffer);
             return error.CryptoError;
-        }
+        };
 
         return out_buffer;
     }
@@ -983,7 +982,9 @@ pub const QuicTransport = struct {
 
     pub fn init(allocator: Allocator, local_addr: net.Address, remote_addr: net.Address) !Self {
         // Use UDP for QUIC transport
-        const socket = try net.udpConnectToAddress(remote_addr);
+        // Create UDP socket for QUIC
+        const socket_fd = try std.posix.socket(remote_addr.any.family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
+        const socket = net.Stream{ .handle = socket_fd };
 
         return Self{
             .socket = socket,
@@ -1398,7 +1399,7 @@ pub const QuicConnection = struct {
 
         // Read frames from stream until complete response
         while (true) {
-            const frame = try self.readFrameFromStream(stream) orelse break;
+            const frame = try self.readFrameFromStream(&stream) orelse break;
             defer self.allocator.free(frame.payload);
 
             switch (frame.frame_type) {
