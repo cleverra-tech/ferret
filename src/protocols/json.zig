@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const HashMap = std.HashMap;
 const StringHashMap = std.StringHashMap;
+// const raii = @import("../core/raii.zig"); // Temporarily commented for testing
 
 /// JSON value types
 pub const ValueType = enum {
@@ -36,6 +37,33 @@ pub const ParseError = error{
     TooDeep,
     OutOfMemory,
     TypeMismatch,
+    StringTooLong,
+    NumberTooLong,
+    CommentNotAllowed,
+    TrailingCommaNotAllowed,
+};
+
+/// JSON configuration options
+pub const JsonConfig = struct {
+    allow_comments: bool = false,
+    allow_trailing_commas: bool = false,
+    max_parsing_depth: u32 = 128,
+    max_string_length: u32 = 1024 * 1024, // 1MB
+    max_number_length: u32 = 1024, // 1KB
+    
+    pub fn default() JsonConfig {
+        return JsonConfig{};
+    }
+    
+    pub fn lenient() JsonConfig {
+        return JsonConfig{
+            .allow_comments = true,
+            .allow_trailing_commas = true,
+            .max_parsing_depth = 256,
+            .max_string_length = 10 * 1024 * 1024, // 10MB
+            .max_number_length = 4096, // 4KB
+        };
+    }
 };
 
 /// JSON value representation with optional zero-copy strings
@@ -141,7 +169,7 @@ pub const Parser = struct {
     pos: usize,
     line: u32,
     column: u32,
-    max_depth: u32,
+    config: JsonConfig,
     current_depth: u32,
 
     const Self = @This();
@@ -153,7 +181,19 @@ pub const Parser = struct {
             .pos = 0,
             .line = 1,
             .column = 1,
-            .max_depth = 128, // Prevent stack overflow
+            .config = JsonConfig.default(),
+            .current_depth = 0,
+        };
+    }
+
+    pub fn initWithConfig(allocator: Allocator, input: []const u8, config: JsonConfig) Self {
+        return Self{
+            .allocator = allocator,
+            .input = input,
+            .pos = 0,
+            .line = 1,
+            .column = 1,
+            .config = config,
             .current_depth = 0,
         };
     }
@@ -165,7 +205,7 @@ pub const Parser = struct {
     }
 
     fn parseValue(self: *Self) ParseError!Value {
-        if (self.current_depth >= self.max_depth) {
+        if (self.current_depth >= self.config.max_parsing_depth) {
             return ParseError.TooDeep;
         }
 
@@ -182,6 +222,7 @@ pub const Parser = struct {
             '[' => self.parseArray(),
             '{' => self.parseObject(),
             '-', '0'...'9' => self.parseNumber(),
+            '/' => if (!self.config.allow_comments) ParseError.CommentNotAllowed else ParseError.InvalidCharacter,
             else => ParseError.InvalidCharacter,
         };
     }
@@ -224,12 +265,18 @@ pub const Parser = struct {
 
         const start = self.pos;
         var needs_unescape = false;
+        var string_length: u32 = 0;
 
         while (self.pos < self.input.len) {
             const char = self.input[self.pos];
             if (char == '"') {
                 const end = self.pos;
                 self.advance(1); // Skip closing quote
+
+                // Check string length limits
+                if (string_length > self.config.max_string_length) {
+                    return ParseError.StringTooLong;
+                }
 
                 if (needs_unescape) {
                     const unescaped = try self.unescapeString(self.input[start..end]);
@@ -245,10 +292,12 @@ pub const Parser = struct {
                     return ParseError.UnexpectedEndOfInput;
                 }
                 self.advance(1);
+                string_length += 1;
             } else if (char < 0x20) {
                 return ParseError.InvalidCharacter;
             } else {
                 self.advance(1);
+                string_length += 1;
             }
         }
         return ParseError.UnexpectedEndOfInput;
@@ -292,6 +341,14 @@ pub const Parser = struct {
             } else if (char == ',') {
                 self.advance(1);
                 self.skipWhitespace();
+                // Check for trailing comma
+                if (self.pos < self.input.len and self.input[self.pos] == ']') {
+                    if (!self.config.allow_trailing_commas) {
+                        return ParseError.TrailingCommaNotAllowed;
+                    }
+                    self.advance(1);
+                    break;
+                }
             } else {
                 return ParseError.UnexpectedToken;
             }
@@ -355,6 +412,15 @@ pub const Parser = struct {
                 break;
             } else if (char == ',') {
                 self.advance(1);
+                self.skipWhitespace();
+                // Check for trailing comma
+                if (self.pos < self.input.len and self.input[self.pos] == '}') {
+                    if (!self.config.allow_trailing_commas) {
+                        return ParseError.TrailingCommaNotAllowed;
+                    }
+                    self.advance(1);
+                    break;
+                }
             } else {
                 return ParseError.UnexpectedToken;
             }
@@ -413,6 +479,12 @@ pub const Parser = struct {
         }
 
         const number_str = self.input[start..self.pos];
+        
+        // Check number length limits
+        if (number_str.len > self.config.max_number_length) {
+            return ParseError.NumberTooLong;
+        }
+        
         if (is_float) {
             const float_val = std.fmt.parseFloat(f64, number_str) catch return ParseError.InvalidNumber;
             return Value{ .float = float_val };
@@ -551,9 +623,52 @@ pub const Parser = struct {
                     self.column += 1;
                 }
                 self.pos += 1;
+            } else if (char == '/' and self.config.allow_comments) {
+                self.skipComment() catch break; // Stop on comment parse errors
             } else {
                 break;
             }
+        }
+    }
+
+    fn skipComment(self: *Self) ParseError!void {
+        if (self.pos + 1 >= self.input.len) return ParseError.InvalidCharacter;
+        
+        const next_char = self.input[self.pos + 1];
+        if (next_char == '/') {
+            // Single-line comment //
+            self.advance(2); // Skip '//'
+            while (self.pos < self.input.len and self.input[self.pos] != '\n') {
+                self.advance(1);
+            }
+            if (self.pos < self.input.len and self.input[self.pos] == '\n') {
+                self.line += 1;
+                self.column = 1;
+                self.pos += 1;
+            }
+        } else if (next_char == '*') {
+            // Multi-line comment /* ... */
+            self.advance(2); // Skip '/*'
+            while (self.pos + 1 < self.input.len) {
+                if (self.input[self.pos] == '*' and self.input[self.pos + 1] == '/') {
+                    self.advance(2); // Skip '*/'
+                    return;
+                }
+                if (self.input[self.pos] == '\n') {
+                    self.line += 1;
+                    self.column = 1;
+                    self.pos += 1;
+                } else {
+                    self.advance(1);
+                }
+            }
+            return ParseError.UnexpectedEndOfInput; // Unterminated comment
+        } else {
+            // Not a comment, might be division (invalid here)
+            if (!self.config.allow_comments) {
+                return ParseError.CommentNotAllowed;
+            }
+            return ParseError.InvalidCharacter;
         }
     }
 
@@ -702,6 +817,12 @@ pub const Generator = struct {
 /// Convenience function to parse JSON from string
 pub fn parseFromString(allocator: Allocator, json_str: []const u8) ParseError!Value {
     var parser = Parser.init(allocator, json_str);
+    return parser.parse();
+}
+
+/// Convenience function to parse JSON from string with custom configuration
+pub fn parseFromStringWithConfig(allocator: Allocator, json_str: []const u8, config: JsonConfig) ParseError!Value {
+    var parser = Parser.initWithConfig(allocator, json_str, config);
     return parser.parse();
 }
 
@@ -950,6 +1071,107 @@ test "JSON Unicode benchmark" {
     const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
 
     std.log.info("Unicode parsing benchmark: {} iterations in {d:.2} ms ({d:.2} ns/iter)", .{ count, duration_ms, @as(f64, @floatFromInt(duration_ns)) / @as(f64, @floatFromInt(count)) });
+}
+
+test "JSON configuration - trailing commas" {
+    const allocator = std.testing.allocator;
+    
+    // Test trailing comma rejection with default config
+    {
+        const result = parseFromString(allocator, "[1, 2, 3,]");
+        try std.testing.expectError(ParseError.TrailingCommaNotAllowed, result);
+    }
+    
+    // Test trailing comma acceptance with lenient config
+    {
+        const config = JsonConfig.lenient();
+        var value = try parseFromStringWithConfig(allocator, "[1, 2, 3,]", config);
+        defer value.deinit(allocator);
+        
+        const arr = try value.getArray();
+        try std.testing.expect(arr.items.len == 3);
+    }
+    
+    // Test trailing comma in objects
+    {
+        const config = JsonConfig.lenient();
+        var value = try parseFromStringWithConfig(allocator, "{\"a\": 1, \"b\": 2,}", config);
+        defer value.deinit(allocator);
+        
+        const obj = try value.getObject();
+        try std.testing.expect(obj.count() == 2);
+    }
+}
+
+test "JSON configuration - comments" {
+    const allocator = std.testing.allocator;
+    
+    // Test comment rejection with default config
+    {
+        const result = parseFromString(allocator, "// comment\n{\"test\": 42}");
+        try std.testing.expectError(ParseError.CommentNotAllowed, result);
+    }
+    
+    // Test single-line comment support
+    {
+        const config = JsonConfig.lenient();
+        var value = try parseFromStringWithConfig(allocator, "// This is a comment\n{\"test\": 42}", config);
+        defer value.deinit(allocator);
+        
+        const obj = try value.getObject();
+        const test_val = obj.get("test").?;
+        try std.testing.expect(try test_val.getInt() == 42);
+    }
+    
+    // Test multi-line comment support  
+    {
+        const config = JsonConfig.lenient();
+        var value = try parseFromStringWithConfig(allocator, "/* Multi-line\n comment */\n{\"test\": 42}", config);
+        defer value.deinit(allocator);
+        
+        const obj = try value.getObject();
+        const test_val = obj.get("test").?;
+        try std.testing.expect(try test_val.getInt() == 42);
+    }
+}
+
+test "JSON configuration - limits" {
+    const allocator = std.testing.allocator;
+    
+    // Test depth limit
+    {
+        const config = JsonConfig{
+            .max_parsing_depth = 2,
+            .max_string_length = 1000,
+            .max_number_length = 100,
+        };
+        const result = parseFromStringWithConfig(allocator, "[[[1]]]", config);
+        try std.testing.expectError(ParseError.TooDeep, result);
+    }
+    
+    // Test string length limit
+    {
+        const config = JsonConfig{
+            .max_parsing_depth = 100,
+            .max_string_length = 5,
+            .max_number_length = 100,
+        };
+        const long_string = "\"" ++ "a" ** 10 ++ "\"";
+        const result = parseFromStringWithConfig(allocator, long_string, config);
+        try std.testing.expectError(ParseError.StringTooLong, result);
+    }
+    
+    // Test number length limit
+    {
+        const config = JsonConfig{
+            .max_parsing_depth = 100,
+            .max_string_length = 1000,
+            .max_number_length = 5,
+        };
+        const long_number = "123456789";
+        const result = parseFromStringWithConfig(allocator, long_number, config);
+        try std.testing.expectError(ParseError.NumberTooLong, result);
+    }
 }
 
 test "JSON zero-copy string parsing" {
