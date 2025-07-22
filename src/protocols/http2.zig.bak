@@ -1,5 +1,5 @@
 //! HTTP/2 implementation for Ferret
-//!
+//! 
 //! This implementation provides:
 //! - Binary framing layer (RFC 7540)
 //! - HPACK header compression (RFC 7541)
@@ -634,80 +634,8 @@ pub const HpackDecoder = struct {
 
         return out.toOwnedSlice();
     }
-};
 
 const HUFFMAN_DECODE_TABLE = @import("hpack_huffman_table.zig").HUFFMAN_DECODE_TABLE;
-
-/// HTTP/2 stream states
-pub const StreamState = enum {
-    idle,
-    reserved_local,
-    reserved_remote,
-    open,
-    half_closed_local,
-    half_closed_remote,
-    closed,
-};
-
-/// HTTP/2 stream
-pub const Stream = struct {
-    const Self = @This();
-
-    id: u32,
-    state: StreamState,
-    window_size: i32,
-    headers: ArrayList(HeaderEntry),
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, stream_id: u32) Self {
-        return Self{
-            .id = stream_id,
-            .state = .idle,
-            .window_size = 65535,
-            .headers = ArrayList(HeaderEntry).init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        for (self.headers.items) |header| {
-            self.allocator.free(header.name);
-            self.allocator.free(header.value);
-        }
-        self.headers.deinit();
-    }
-};
-
-/// HTTP/2 connection
-pub const Connection = struct {
-    const Self = @This();
-
-    allocator: Allocator,
-    is_server: bool,
-    next_stream_id: u32,
-    settings: Settings,
-    streams: std.AutoHashMap(u32, Stream),
-    window_size: i32,
-
-    pub fn init(allocator: Allocator, is_server: bool) Self {
-        return Self{
-            .allocator = allocator,
-            .is_server = is_server,
-            .next_stream_id = if (is_server) 2 else 1,
-            .settings = Settings{},
-            .streams = std.AutoHashMap(u32, Stream).init(allocator),
-            .window_size = 65535,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        var iterator = self.streams.iterator();
-        while (iterator.next()) |entry| {
-            entry.value_ptr.deinit();
-        }
-        self.streams.deinit();
-    }
-};
 
 /// Helper function to encode HPACK header as literal
 fn encodeHeaderLiteral(buffer: *ArrayList(u8), name: []const u8, value: []const u8) !void {
