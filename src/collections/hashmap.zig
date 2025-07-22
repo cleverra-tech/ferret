@@ -6,6 +6,27 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Common deallocator for string slices
+pub fn deallocateString(allocator: Allocator, string: []const u8) void {
+    allocator.free(@constCast(string));
+}
+
+/// Common deallocator for byte slices
+pub fn deallocateSlice(allocator: Allocator, slice: []const u8) void {
+    allocator.free(@constCast(slice));
+}
+
+/// Deallocator for types with deinit() method
+pub fn deallocateWithDeinit(comptime T: type) fn (allocator: Allocator, value: T) void {
+    return struct {
+        fn deallocate(allocator: Allocator, value: T) void {
+            _ = allocator;
+            var mutable_value = value;
+            mutable_value.deinit();
+        }
+    }.deallocate;
+}
+
 /// Generic hash map implementation using robin hood hashing
 pub fn HashMap(comptime K: type, comptime V: type) type {
     return struct {
@@ -19,10 +40,16 @@ pub fn HashMap(comptime K: type, comptime V: type) type {
 
         const EMPTY_DISTANCE = std.math.maxInt(u32);
 
+        // Optional deallocator functions for memory management
+        pub const KeyDeallocator = ?*const fn (allocator: Allocator, key: K) void;
+        pub const ValueDeallocator = ?*const fn (allocator: Allocator, value: V) void;
+
         entries: []?Entry,
         count: usize,
         allocator: Allocator,
         max_load_factor: f32,
+        key_deallocator: KeyDeallocator,
+        value_deallocator: ValueDeallocator,
 
         /// Initialize empty hash map
         pub fn init(allocator: Allocator) Self {
@@ -31,6 +58,20 @@ pub fn HashMap(comptime K: type, comptime V: type) type {
                 .count = 0,
                 .allocator = allocator,
                 .max_load_factor = 0.75,
+                .key_deallocator = null,
+                .value_deallocator = null,
+            };
+        }
+
+        /// Initialize empty hash map with custom deallocators
+        pub fn initWithDeallocators(allocator: Allocator, key_deallocator: KeyDeallocator, value_deallocator: ValueDeallocator) Self {
+            return Self{
+                .entries = &[_]?Entry{},
+                .count = 0,
+                .allocator = allocator,
+                .max_load_factor = 0.75,
+                .key_deallocator = key_deallocator,
+                .value_deallocator = value_deallocator,
             };
         }
 
@@ -49,11 +90,48 @@ pub fn HashMap(comptime K: type, comptime V: type) type {
                 .count = 0,
                 .allocator = allocator,
                 .max_load_factor = 0.75,
+                .key_deallocator = null,
+                .value_deallocator = null,
+            };
+        }
+
+        /// Initialize hash map with specific capacity and deallocators
+        pub fn initCapacityWithDeallocators(allocator: Allocator, initial_capacity: usize, key_deallocator: KeyDeallocator, value_deallocator: ValueDeallocator) !Self {
+            if (initial_capacity == 0) {
+                return initWithDeallocators(allocator, key_deallocator, value_deallocator);
+            }
+
+            const actual_capacity = nextPowerOfTwo(initial_capacity);
+            const entries = try allocator.alloc(?Entry, actual_capacity);
+            @memset(entries, null);
+
+            return Self{
+                .entries = entries,
+                .count = 0,
+                .allocator = allocator,
+                .max_load_factor = 0.75,
+                .key_deallocator = key_deallocator,
+                .value_deallocator = value_deallocator,
             };
         }
 
         /// Free all allocated memory
         pub fn deinit(self: *Self) void {
+            // First, deallocate all keys and values if deallocators are provided
+            if (self.key_deallocator != null or self.value_deallocator != null) {
+                for (self.entries) |maybe_entry| {
+                    if (maybe_entry) |entry| {
+                        if (self.key_deallocator) |deallocator| {
+                            deallocator(self.allocator, entry.key);
+                        }
+                        if (self.value_deallocator) |deallocator| {
+                            deallocator(self.allocator, entry.value);
+                        }
+                    }
+                }
+            }
+
+            // Then free the entries array
             if (self.entries.len > 0) {
                 self.allocator.free(self.entries);
             }
@@ -191,7 +269,10 @@ pub fn HashMap(comptime K: type, comptime V: type) type {
                 var existing = &self.entries[index].?;
 
                 if (eql(existing.key, key)) {
-                    // Update existing entry
+                    // Update existing entry - deallocate old value first
+                    if (self.value_deallocator) |deallocator| {
+                        deallocator(self.allocator, existing.value);
+                    }
                     existing.value = value;
                     return;
                 }
@@ -250,6 +331,15 @@ pub fn HashMap(comptime K: type, comptime V: type) type {
             var index = result.index;
             const mask = self.entries.len - 1;
 
+            // Deallocate the entry being removed
+            const entry_to_remove = self.entries[index].?;
+            if (self.key_deallocator) |deallocator| {
+                deallocator(self.allocator, entry_to_remove.key);
+            }
+            if (self.value_deallocator) |deallocator| {
+                deallocator(self.allocator, entry_to_remove.value);
+            }
+
             // Mark as deleted
             self.entries[index] = null;
             self.count -= 1;
@@ -276,13 +366,27 @@ pub fn HashMap(comptime K: type, comptime V: type) type {
 
         /// Clear all entries
         pub fn clear(self: *Self) void {
+            // Deallocate all keys and values before clearing
+            if (self.key_deallocator != null or self.value_deallocator != null) {
+                for (self.entries) |maybe_entry| {
+                    if (maybe_entry) |entry| {
+                        if (self.key_deallocator) |deallocator| {
+                            deallocator(self.allocator, entry.key);
+                        }
+                        if (self.value_deallocator) |deallocator| {
+                            deallocator(self.allocator, entry.value);
+                        }
+                    }
+                }
+            }
+
             @memset(self.entries, null);
             self.count = 0;
         }
 
         /// Clone the hash map with a new allocator
         pub fn clone(self: Self, allocator: Allocator) !Self {
-            var result = try Self.initCapacity(allocator, self.count);
+            var result = try Self.initCapacityWithDeallocators(allocator, self.count, self.key_deallocator, self.value_deallocator);
 
             for (self.entries) |maybe_entry| {
                 if (maybe_entry) |entry| {
@@ -488,4 +592,60 @@ test "HashMap clone" {
     try original.put(3, "three");
     try std.testing.expectEqual(@as(usize, 3), original.len());
     try std.testing.expectEqual(@as(usize, 2), cloned.len());
+}
+
+test "HashMap memory management with string deallocators" {
+    const allocator = std.testing.allocator;
+
+    // Create map with string deallocators
+    var map = HashMap([]const u8, []const u8).initWithDeallocators(
+        allocator,
+        deallocateString,
+        deallocateString,
+    );
+    defer map.deinit();
+
+    // Create owned strings
+    const key1 = try allocator.dupe(u8, "key1");
+    const value1 = try allocator.dupe(u8, "value1");
+    const key2 = try allocator.dupe(u8, "key2");
+    const value2 = try allocator.dupe(u8, "value2");
+    const new_value1 = try allocator.dupe(u8, "new_value1");
+
+    try map.put(key1, value1);
+    try map.put(key2, value2);
+    try std.testing.expectEqual(@as(usize, 2), map.len());
+
+    // Replace value - old value should be deallocated
+    try map.put(key1, new_value1);
+    try std.testing.expectEqual(@as(usize, 2), map.len());
+    try std.testing.expectEqualStrings("new_value1", map.get(key1).?);
+
+    // Remove entry - both key and value should be deallocated
+    try std.testing.expect(map.remove(key2));
+    try std.testing.expectEqual(@as(usize, 1), map.len());
+
+    // deinit() will clean up remaining entries
+}
+
+test "HashMap memory management with clear()" {
+    const allocator = std.testing.allocator;
+
+    var map = HashMap([]const u8, i32).initWithDeallocators(
+        allocator,
+        deallocateString,
+        null, // i32 doesn't need deallocation
+    );
+    defer map.deinit();
+
+    const key1 = try allocator.dupe(u8, "key1");
+    const key2 = try allocator.dupe(u8, "key2");
+
+    try map.put(key1, 1);
+    try map.put(key2, 2);
+    try std.testing.expectEqual(@as(usize, 2), map.len());
+
+    // clear() should deallocate all keys
+    map.clear();
+    try std.testing.expectEqual(@as(usize, 0), map.len());
 }
