@@ -188,6 +188,7 @@ pub const Status = enum(u16) {
 pub const Headers = struct {
     map: std.StringHashMap([]const u8),
     allocator: Allocator,
+    owns_values: bool, // Track whether values should be deallocated
 
     const Self = @This();
 
@@ -195,14 +196,27 @@ pub const Headers = struct {
         return Self{
             .map = std.StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
+            .owns_values = false,
+        };
+    }
+
+    /// Initialize headers with control over value ownership
+    pub fn initWithOwnership(allocator: Allocator, owns_values: bool) Self {
+        return Self{
+            .map = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
+            .owns_values = owns_values,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // Free all allocated keys
+        // Free all allocated keys and values
         var iterator = self.map.iterator();
         while (iterator.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
+            if (self.owns_values) {
+                self.allocator.free(@constCast(entry.value_ptr.*));
+            }
         }
         self.map.deinit();
     }
@@ -215,12 +229,38 @@ pub const Headers = struct {
             lower_key[i] = std.ascii.toLower(c);
         }
 
-        // Check if key already exists and free old key
+        // Check if key already exists and free old key and value
         if (self.map.fetchRemove(lower_key)) |old_entry| {
             self.allocator.free(old_entry.key);
+            if (self.owns_values) {
+                self.allocator.free(@constCast(old_entry.value));
+            }
         }
 
         try self.map.put(lower_key, value);
+    }
+
+    /// Set header value with ownership control
+    pub fn setOwned(self: *Self, key: []const u8, value: []const u8) !void {
+        // Store lowercase key for case-insensitive lookup
+        const lower_key = try self.allocator.alloc(u8, key.len);
+        for (key, 0..) |c, i| {
+            lower_key[i] = std.ascii.toLower(c);
+        }
+
+        // Always duplicate the value to ensure we own it
+        const owned_value = try self.allocator.dupe(u8, value);
+
+        // Check if key already exists and free old key and value
+        if (self.map.fetchRemove(lower_key)) |old_entry| {
+            self.allocator.free(old_entry.key);
+            if (self.owns_values) {
+                self.allocator.free(@constCast(old_entry.value));
+            }
+        }
+
+        try self.map.put(lower_key, owned_value);
+        self.owns_values = true;
     }
 
     /// Get header value (case-insensitive key)
@@ -1012,4 +1052,54 @@ test "Parser reset functionality" {
     try testing.expect(parser.state == .start);
     try testing.expect(parser.content_length == -1);
     try testing.expect(parser.bytes_read == 0);
+}
+
+test "Headers memory management with value ownership" {
+    // Test without value ownership (default behavior)
+    var headers = Headers.init(testing.allocator);
+    defer headers.deinit();
+
+    try headers.set("content-type", "application/json");
+    try headers.set("content-length", "100");
+
+    // Replace value - should not deallocate since we don't own values
+    try headers.set("content-type", "text/plain");
+    try testing.expectEqualStrings("text/plain", headers.get("content-type").?);
+
+    // Test with value ownership
+    var owned_headers = Headers.initWithOwnership(testing.allocator, true);
+    defer owned_headers.deinit();
+
+    // Using setOwned to ensure we own the values
+    try owned_headers.setOwned("authorization", "Bearer token123");
+    try owned_headers.setOwned("user-agent", "Ferret/1.0");
+
+    try testing.expectEqualStrings("Bearer token123", owned_headers.get("authorization").?);
+    try testing.expectEqualStrings("Ferret/1.0", owned_headers.get("user-agent").?);
+
+    // Replace owned value - should deallocate old value
+    try owned_headers.setOwned("authorization", "Bearer newtoken456");
+    try testing.expectEqualStrings("Bearer newtoken456", owned_headers.get("authorization").?);
+}
+
+test "Headers safe value ownership" {
+    // Test safer ownership pattern - separate instances for different ownership models
+
+    // Headers with only borrowed values
+    var borrowed_headers = Headers.init(testing.allocator);
+    defer borrowed_headers.deinit();
+    try borrowed_headers.set("host", "example.com");
+    try borrowed_headers.set("user-agent", "test-agent");
+    try testing.expect(!borrowed_headers.owns_values);
+
+    // Headers with only owned values
+    var owned_headers = Headers.initWithOwnership(testing.allocator, true);
+    defer owned_headers.deinit();
+    try owned_headers.setOwned("authorization", "Bearer token");
+    try owned_headers.setOwned("content-type", "application/json");
+    try testing.expect(owned_headers.owns_values);
+
+    // Verify values are accessible
+    try testing.expectEqualStrings("example.com", borrowed_headers.get("host").?);
+    try testing.expectEqualStrings("Bearer token", owned_headers.get("authorization").?);
 }
