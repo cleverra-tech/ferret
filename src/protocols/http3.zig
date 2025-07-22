@@ -646,34 +646,264 @@ pub const CryptoState = struct {
         return out_buffer;
     }
 
+    /// TLS handshake message types
+    const TlsHandshakeType = enum(u8) {
+        client_hello = 1,
+        server_hello = 2,
+        new_session_ticket = 4,
+        end_of_early_data = 5,
+        encrypted_extensions = 8,
+        certificate = 11,
+        certificate_request = 13,
+        certificate_verify = 15,
+        finished = 20,
+        key_update = 24,
+        message_hash = 254,
+        _,
+    };
+
     /// Process CRYPTO frame during handshake
     pub fn processCryptoFrame(self: *Self, crypto_data: []const u8, allocator: Allocator) !void {
-        _ = allocator;
-        // This is a simplified TLS 1.3 handshake processor for QUIC
+        if (crypto_data.len == 0) return error.InvalidCryptoData;
+
         var pos: usize = 0;
         while (pos < crypto_data.len) {
             if (pos + 4 > crypto_data.len) return error.InvalidCryptoData;
-            const msg_type = crypto_data[pos];
-            const msg_len = mem.readInt(u24, crypto_data[pos + 1 .. pos + 4], .big);
+
+            const msg_type_value = crypto_data[pos];
+            const msg_len = mem.readInt(u24, crypto_data[pos + 1 .. pos + 4][0..3], .big);
             pos += 4;
 
+            if (msg_len > 0x100000) return error.InvalidCryptoData; // Sanity check: 1MB max
             if (pos + msg_len > crypto_data.len) return error.InvalidCryptoData;
-            const msg_data = crypto_data[pos .. pos + msg_len];
-            _ = msg_data;
-            pos += msg_len;
 
-            switch (msg_type) {
-                // ServerHello
-                2 => {
-                    // In a real implementation, we would parse the ServerHello,
-                    // extract the server's key share, and derive the handshake secrets.
-                    // For now, we'll just mark the handshake as complete.
-                    self.handshake_complete = true;
+            const msg_data = crypto_data[pos .. pos + msg_len];
+            const msg_type: TlsHandshakeType = @enumFromInt(msg_type_value);
+
+            try self.processHandshakeMessage(msg_type, msg_data, allocator);
+            pos += msg_len;
+        }
+    }
+
+    /// Process individual TLS handshake messages
+    fn processHandshakeMessage(self: *Self, msg_type: TlsHandshakeType, msg_data: []const u8, allocator: Allocator) !void {
+        switch (msg_type) {
+            .server_hello => {
+                try self.processServerHello(msg_data, allocator);
+            },
+            .encrypted_extensions => {
+                try self.processEncryptedExtensions(msg_data, allocator);
+            },
+            .certificate => {
+                try self.processCertificate(msg_data, allocator);
+            },
+            .certificate_verify => {
+                try self.processCertificateVerify(msg_data, allocator);
+            },
+            .finished => {
+                try self.processFinished(msg_data, allocator);
+            },
+            .new_session_ticket => {
+                // Optional: handle session resumption
+            },
+            else => {
+                // Ignore unknown handshake messages for forward compatibility
+            },
+        }
+    }
+
+    /// Process ServerHello handshake message
+    fn processServerHello(self: *Self, msg_data: []const u8, allocator: Allocator) !void {
+        _ = allocator;
+        if (msg_data.len < 38) return error.InvalidServerHello; // Minimum ServerHello size
+
+        var pos: usize = 0;
+
+        // Protocol Version (2 bytes)
+        const protocol_version = mem.readInt(u16, msg_data[pos .. pos + 2][0..2], .big);
+        if (protocol_version != 0x0303) return error.UnsupportedProtocolVersion; // TLS 1.2 for legacy
+        pos += 2;
+
+        // Server Random (32 bytes)
+        if (pos + 32 > msg_data.len) return error.InvalidServerHello;
+        const server_random = msg_data[pos .. pos + 32];
+        _ = server_random; // Would be used for key derivation in full implementation
+        pos += 32;
+
+        // Session ID length + Session ID
+        if (pos >= msg_data.len) return error.InvalidServerHello;
+        const session_id_len = msg_data[pos];
+        pos += 1;
+        if (pos + session_id_len > msg_data.len) return error.InvalidServerHello;
+        pos += session_id_len;
+
+        // Cipher Suite (2 bytes)
+        if (pos + 2 > msg_data.len) return error.InvalidServerHello;
+        const cipher_suite = mem.readInt(u16, msg_data[pos .. pos + 2][0..2], .big);
+        if (cipher_suite != 0x1301) return error.UnsupportedCipherSuite; // TLS_AES_128_GCM_SHA256
+        pos += 2;
+
+        // Compression Method (1 byte)
+        if (pos >= msg_data.len) return error.InvalidServerHello;
+        if (msg_data[pos] != 0x00) return error.UnsupportedCompressionMethod;
+        pos += 1;
+
+        // Extensions
+        if (pos + 2 <= msg_data.len) {
+            const extensions_len = mem.readInt(u16, msg_data[pos .. pos + 2][0..2], .big);
+            pos += 2;
+            if (pos + extensions_len > msg_data.len) return error.InvalidServerHello;
+
+            try self.processServerHelloExtensions(msg_data[pos .. pos + extensions_len]);
+        }
+
+        // Mark that ServerHello was processed
+        self.handshake_complete = false; // Not complete yet, need more messages
+    }
+
+    /// Process ServerHello extensions
+    fn processServerHelloExtensions(self: *Self, extensions_data: []const u8) !void {
+        var pos: usize = 0;
+
+        while (pos + 4 <= extensions_data.len) {
+            const ext_type = mem.readInt(u16, extensions_data[pos .. pos + 2][0..2], .big);
+            const ext_len = mem.readInt(u16, extensions_data[pos + 2 .. pos + 4][0..2], .big);
+            pos += 4;
+
+            if (pos + ext_len > extensions_data.len) return error.InvalidExtensions;
+            const ext_data = extensions_data[pos .. pos + ext_len];
+
+            switch (ext_type) {
+                0x002b => { // supported_versions
+                    if (ext_len != 2) return error.InvalidExtensions;
+                    const version = mem.readInt(u16, ext_data[0..2], .big);
+                    if (version != 0x0304) return error.UnsupportedProtocolVersion; // TLS 1.3
                 },
-                // Other handshake messages (EncryptedExtensions, Certificate, etc.)
-                // would be handled here.
-                else => {},
+                0x0033 => { // key_share
+                    try self.processKeyShareExtension(ext_data);
+                },
+                else => {
+                    // Ignore unknown extensions
+                },
             }
+
+            pos += ext_len;
+        }
+    }
+
+    /// Process key_share extension from ServerHello
+    fn processKeyShareExtension(self: *Self, key_share_data: []const u8) !void {
+        if (key_share_data.len < 4) return error.InvalidKeyShare;
+
+        const group = mem.readInt(u16, key_share_data[0..2][0..2], .big);
+        const key_exchange_len = mem.readInt(u16, key_share_data[2..4][0..2], .big);
+
+        if (group != 0x001d) return error.UnsupportedGroup; // x25519
+        if (key_exchange_len != 32) return error.InvalidKeyShare;
+        if (4 + key_exchange_len > key_share_data.len) return error.InvalidKeyShare;
+
+        const server_public_key = key_share_data[4 .. 4 + 32];
+        _ = server_public_key; // Would be used for ECDH key derivation
+
+        // In a real implementation, we would:
+        // 1. Perform ECDH with our private key and server's public key
+        // 2. Derive the shared secret
+        // 3. Update key material for subsequent encryption
+        // For now, we'll use placeholder key derivation
+        self.deriveHandshakeKeys();
+    }
+
+    /// Process EncryptedExtensions handshake message
+    fn processEncryptedExtensions(self: *Self, msg_data: []const u8, allocator: Allocator) !void {
+        _ = self;
+        _ = allocator;
+
+        if (msg_data.len < 2) return error.InvalidEncryptedExtensions;
+
+        const extensions_len = mem.readInt(u16, msg_data[0..2][0..2], .big);
+        if (2 + extensions_len > msg_data.len) return error.InvalidEncryptedExtensions;
+
+        // In a real implementation, we would parse and validate extensions
+        // For now, just validate the structure
+    }
+
+    /// Process Certificate handshake message
+    fn processCertificate(self: *Self, msg_data: []const u8, allocator: Allocator) !void {
+        _ = self;
+        _ = allocator;
+
+        if (msg_data.len < 4) return error.InvalidCertificate;
+
+        // Certificate Request Context Length (1 byte) + Context + Certificates
+        const cert_req_ctx_len = msg_data[0];
+        var pos: usize = 1 + cert_req_ctx_len;
+
+        if (pos + 3 > msg_data.len) return error.InvalidCertificate;
+        const cert_list_len = mem.readInt(u24, msg_data[pos .. pos + 3][0..3], .big);
+        pos += 3;
+
+        if (pos + cert_list_len > msg_data.len) return error.InvalidCertificate;
+
+        // In a real implementation, we would parse and validate certificates
+        // For now, just validate the structure is reasonable
+        if (cert_list_len == 0) return error.InvalidCertificate; // Must have at least one certificate
+    }
+
+    /// Process CertificateVerify handshake message
+    fn processCertificateVerify(self: *Self, msg_data: []const u8, allocator: Allocator) !void {
+        _ = self;
+        _ = allocator;
+
+        if (msg_data.len < 4) return error.InvalidCertificateVerify;
+
+        // Signature Algorithm (2 bytes) + Signature Length (2 bytes) + Signature
+        const sig_alg = mem.readInt(u16, msg_data[0..2][0..2], .big);
+        const sig_len = mem.readInt(u16, msg_data[2..4][0..2], .big);
+
+        if (4 + sig_len > msg_data.len) return error.InvalidCertificateVerify;
+
+        // Validate signature algorithm is supported
+        switch (sig_alg) {
+            0x0804, 0x0805, 0x0806 => {}, // RSA-PSS variants
+            0x0403, 0x0503, 0x0603 => {}, // ECDSA variants
+            else => return error.UnsupportedSignatureAlgorithm,
+        }
+
+        // In a real implementation, we would verify the signature
+        // For now, just validate structure
+    }
+
+    /// Process Finished handshake message
+    fn processFinished(self: *Self, msg_data: []const u8, allocator: Allocator) !void {
+        _ = allocator;
+
+        // Finished message contains a MAC/hash of all previous handshake messages
+        if (msg_data.len != 32) return error.InvalidFinished; // SHA256 hash size
+
+        // In a real implementation, we would:
+        // 1. Compute expected Finished MAC using handshake transcript
+        // 2. Compare with received MAC
+        // For now, we'll assume verification succeeds
+
+        self.handshake_complete = true;
+    }
+
+    /// Derive handshake keys (placeholder implementation)
+    fn deriveHandshakeKeys(self: *Self) void {
+        // In a real implementation, this would:
+        // 1. Use HKDF to derive traffic secrets from shared secret
+        // 2. Derive encryption/decryption keys and IVs
+        // 3. Update the key material for packet protection
+
+        // For now, use a simple key derivation based on existing material
+        var i: usize = 0;
+        while (i < self.key_material.len) : (i += 1) {
+            self.key_material[i] ^= 0xAA; // Simple transformation
+        }
+
+        i = 0;
+        while (i < self.iv.len) : (i += 1) {
+            self.iv[i] ^= 0x55; // Simple transformation
         }
     }
 };
@@ -735,6 +965,20 @@ pub const QuicTransport = struct {
         NetworkError,
         HandshakeFailed,
         ProtocolViolation,
+        // TLS-specific errors
+        InvalidCryptoData,
+        InvalidServerHello,
+        InvalidEncryptedExtensions,
+        InvalidCertificate,
+        InvalidCertificateVerify,
+        InvalidFinished,
+        InvalidExtensions,
+        InvalidKeyShare,
+        UnsupportedProtocolVersion,
+        UnsupportedCipherSuite,
+        UnsupportedCompressionMethod,
+        UnsupportedGroup,
+        UnsupportedSignatureAlgorithm,
     };
 
     pub fn init(allocator: Allocator, local_addr: net.Address, remote_addr: net.Address) !Self {
@@ -1439,4 +1683,222 @@ test "HTTP/3 settings" {
     try testing.expect(settings.qpack_max_table_capacity == 4096);
     try testing.expect(settings.qpack_blocked_streams == 0);
     try testing.expect(settings.max_field_section_size == null);
+}
+
+test "TLS handshake message parsing - ServerHello" {
+    var crypto_state = CryptoState.init();
+    defer crypto_state.deinit();
+
+    // Construct a minimal valid ServerHello message
+    var server_hello = ArrayList(u8).init(testing.allocator);
+    defer server_hello.deinit();
+
+    // Handshake message header: type (2) + length placeholder
+    try server_hello.append(0x02); // ServerHello
+    const length_start = server_hello.items.len;
+    try server_hello.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 }); // Length placeholder
+    const data_start = server_hello.items.len;
+
+    // Protocol Version: TLS 1.2 (0x0303)
+    try server_hello.appendSlice(&[_]u8{ 0x03, 0x03 });
+
+    // Server Random (32 bytes)
+    var random: [32]u8 = undefined;
+    std.crypto.random.bytes(&random);
+    try server_hello.appendSlice(&random);
+
+    // Session ID length (1) + Session ID (empty)
+    try server_hello.append(0x00);
+
+    // Cipher Suite: TLS_AES_128_GCM_SHA256 (0x1301)
+    try server_hello.appendSlice(&[_]u8{ 0x13, 0x01 });
+
+    // Compression Method: null (0x00)
+    try server_hello.append(0x00);
+
+    // Extensions
+    const ext_start = server_hello.items.len;
+    try server_hello.appendSlice(&[_]u8{ 0x00, 0x00 }); // Extensions length placeholder
+
+    // Supported Versions extension (0x002b, len=2, value=0x0304)
+    try server_hello.appendSlice(&[_]u8{ 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04 });
+
+    // Update extensions length
+    const ext_len = server_hello.items.len - ext_start - 2;
+    server_hello.items[ext_start] = @intCast((ext_len >> 8) & 0xFF);
+    server_hello.items[ext_start + 1] = @intCast(ext_len & 0xFF);
+
+    // Update the length field
+    const msg_len = server_hello.items.len - data_start;
+    server_hello.items[length_start] = @intCast((msg_len >> 16) & 0xFF);
+    server_hello.items[length_start + 1] = @intCast((msg_len >> 8) & 0xFF);
+    server_hello.items[length_start + 2] = @intCast(msg_len & 0xFF);
+
+    // Process the crypto frame
+    try crypto_state.processCryptoFrame(server_hello.items, testing.allocator);
+
+    // ServerHello alone doesn't complete handshake
+    try testing.expect(!crypto_state.handshake_complete);
+}
+
+test "TLS handshake message parsing - Finished" {
+    var crypto_state = CryptoState.init();
+    defer crypto_state.deinit();
+
+    // Construct a Finished message
+    var finished_msg = ArrayList(u8).init(testing.allocator);
+    defer finished_msg.deinit();
+
+    // Handshake message header: type (20) + length (3 bytes)
+    try finished_msg.append(0x14); // Finished
+    try finished_msg.appendSlice(&[_]u8{ 0x00, 0x00, 0x20 }); // Length: 32 bytes
+
+    // Finished MAC (32 bytes of dummy data)
+    var mac: [32]u8 = undefined;
+    std.crypto.random.bytes(&mac);
+    try finished_msg.appendSlice(&mac);
+
+    // Process the crypto frame
+    try crypto_state.processCryptoFrame(finished_msg.items, testing.allocator);
+
+    // Finished message completes the handshake
+    try testing.expect(crypto_state.handshake_complete);
+}
+
+test "TLS handshake error handling - invalid data" {
+    var crypto_state = CryptoState.init();
+    defer crypto_state.deinit();
+
+    // Test empty crypto data
+    try testing.expectError(QuicTransport.TransportError.InvalidCryptoData, crypto_state.processCryptoFrame(&[_]u8{}, testing.allocator));
+
+    // Test truncated header
+    const truncated = [_]u8{ 0x02, 0x00 }; // Missing length bytes
+    try testing.expectError(QuicTransport.TransportError.InvalidCryptoData, crypto_state.processCryptoFrame(&truncated, testing.allocator));
+
+    // Test message length exceeding available data
+    const invalid_length = [_]u8{ 0x02, 0x00, 0x10, 0x00, 0x01 }; // Claims 4096 bytes but only 1 byte follows
+    try testing.expectError(QuicTransport.TransportError.InvalidCryptoData, crypto_state.processCryptoFrame(&invalid_length, testing.allocator));
+}
+
+test "TLS handshake error handling - ServerHello validation" {
+    var crypto_state = CryptoState.init();
+    defer crypto_state.deinit();
+
+    // Test ServerHello that's too small
+    var small_hello = ArrayList(u8).init(testing.allocator);
+    defer small_hello.deinit();
+    try small_hello.append(0x02); // ServerHello
+    try small_hello.appendSlice(&[_]u8{ 0x00, 0x00, 0x05 }); // Length: 5 bytes (too small)
+    try small_hello.appendSlice(&[_]u8{ 0x03, 0x03, 0x00, 0x00, 0x00 });
+
+    try testing.expectError(QuicTransport.TransportError.InvalidServerHello, crypto_state.processCryptoFrame(small_hello.items, testing.allocator));
+
+    // Test unsupported cipher suite
+    var bad_cipher = ArrayList(u8).init(testing.allocator);
+    defer bad_cipher.deinit();
+    try bad_cipher.append(0x02); // ServerHello
+    const bad_length_start = bad_cipher.items.len;
+    try bad_cipher.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 }); // Length placeholder
+    const bad_data_start = bad_cipher.items.len;
+    try bad_cipher.appendSlice(&[_]u8{ 0x03, 0x03 }); // Protocol version
+
+    // Server Random (32 bytes)
+    var random: [32]u8 = undefined;
+    std.crypto.random.bytes(&random);
+    try bad_cipher.appendSlice(&random);
+
+    try bad_cipher.append(0x00); // Session ID length
+    try bad_cipher.appendSlice(&[_]u8{ 0x00, 0x35 }); // Unsupported cipher suite
+    try bad_cipher.append(0x00); // Compression method
+    try bad_cipher.appendSlice(&[_]u8{ 0x00, 0x00 }); // No extensions
+
+    // Update the length field
+    const bad_msg_len = bad_cipher.items.len - bad_data_start;
+    bad_cipher.items[bad_length_start] = @intCast((bad_msg_len >> 16) & 0xFF);
+    bad_cipher.items[bad_length_start + 1] = @intCast((bad_msg_len >> 8) & 0xFF);
+    bad_cipher.items[bad_length_start + 2] = @intCast(bad_msg_len & 0xFF);
+
+    try testing.expectError(QuicTransport.TransportError.UnsupportedCipherSuite, crypto_state.processCryptoFrame(bad_cipher.items, testing.allocator));
+}
+
+test "TLS handshake multiple messages" {
+    var crypto_state = CryptoState.init();
+    defer crypto_state.deinit();
+
+    // Construct multiple handshake messages in one CRYPTO frame
+    var multi_msg = ArrayList(u8).init(testing.allocator);
+    defer multi_msg.deinit();
+
+    // First message: ServerHello (minimal)
+    try multi_msg.append(0x02); // ServerHello
+    const multi_length_start = multi_msg.items.len;
+    try multi_msg.appendSlice(&[_]u8{ 0x00, 0x00, 0x00 }); // Length placeholder
+    const multi_data_start = multi_msg.items.len;
+    try multi_msg.appendSlice(&[_]u8{ 0x03, 0x03 }); // Protocol version
+
+    var random: [32]u8 = undefined;
+    std.crypto.random.bytes(&random);
+    try multi_msg.appendSlice(&random); // Server random
+
+    try multi_msg.append(0x00); // Session ID length
+    try multi_msg.appendSlice(&[_]u8{ 0x13, 0x01 }); // Cipher suite
+    try multi_msg.append(0x00); // Compression method
+    try multi_msg.appendSlice(&[_]u8{ 0x00, 0x00 }); // No extensions
+
+    // Update ServerHello length
+    const multi_msg_len = multi_msg.items.len - multi_data_start;
+    multi_msg.items[multi_length_start] = @intCast((multi_msg_len >> 16) & 0xFF);
+    multi_msg.items[multi_length_start + 1] = @intCast((multi_msg_len >> 8) & 0xFF);
+    multi_msg.items[multi_length_start + 2] = @intCast(multi_msg_len & 0xFF);
+
+    // Second message: EncryptedExtensions (minimal)
+    try multi_msg.append(0x08); // EncryptedExtensions
+    try multi_msg.appendSlice(&[_]u8{ 0x00, 0x00, 0x02 }); // Length: 2 bytes
+    try multi_msg.appendSlice(&[_]u8{ 0x00, 0x00 }); // No extensions
+
+    // Third message: Finished
+    try multi_msg.append(0x14); // Finished
+    try multi_msg.appendSlice(&[_]u8{ 0x00, 0x00, 0x20 }); // Length: 32 bytes
+
+    var mac: [32]u8 = undefined;
+    std.crypto.random.bytes(&mac);
+    try multi_msg.appendSlice(&mac); // Finished MAC
+
+    // Process all messages in one go
+    try crypto_state.processCryptoFrame(multi_msg.items, testing.allocator);
+
+    // Handshake should be complete after processing Finished message
+    try testing.expect(crypto_state.handshake_complete);
+}
+
+test "Key derivation placeholder" {
+    var crypto_state = CryptoState.init();
+    defer crypto_state.deinit();
+
+    // Store original key material
+    const original_key = crypto_state.key_material;
+    const original_iv = crypto_state.iv;
+
+    // Trigger key derivation
+    crypto_state.deriveHandshakeKeys();
+
+    // Verify key material was modified (simple XOR transformation)
+    var keys_changed = false;
+    for (original_key, crypto_state.key_material) |orig, new| {
+        if (orig != new) {
+            keys_changed = true;
+            break;
+        }
+    }
+    try testing.expect(keys_changed);
+
+    var ivs_changed = false;
+    for (original_iv, crypto_state.iv) |orig, new| {
+        if (orig != new) {
+            ivs_changed = true;
+            break;
+        }
+    }
+    try testing.expect(ivs_changed);
 }
