@@ -165,6 +165,12 @@ pub fn LockFreeQueue(comptime T: type) type {
             }
         }
 
+        /// Remove and return the first item from the queue.
+        /// Returns null if the queue is empty.
+        ///
+        /// IMPORTANT: If T is a dynamically allocated type (e.g., []u8, ArrayList, etc.),
+        /// the caller is responsible for deallocating the returned item to prevent memory leaks.
+        /// The queue only manages the storage nodes, not the item contents.
         pub fn dequeue(self: *Self) ?T {
             while (true) {
                 const current_head = self.head.load(.acquire);

@@ -736,21 +736,22 @@ pub const Connection = struct {
         var remaining = data;
         while (remaining.len > 0) {
             if (try self.parser.parse(remaining)) |frame| {
-                defer if (frame.payload.len > 0) self.allocator.free(frame.payload);
+                var mutable_frame = frame;
+                defer mutable_frame.deinit();
 
                 // Update statistics
                 self.bytes_received += remaining.len;
 
                 // Process frame based on opcode
-                switch (frame.header.opcode) {
+                switch (mutable_frame.header.opcode) {
                     .text, .binary => {
-                        if (try self.handleDataFrame(frame)) |message| {
+                        if (try self.handleDataFrame(mutable_frame)) |message| {
                             try messages.append(message);
                             self.messages_received += 1;
                         }
                     },
                     .continuation => {
-                        if (try self.handleContinuationFrame(frame)) |message| {
+                        if (try self.handleContinuationFrame(mutable_frame)) |message| {
                             try messages.append(message);
                             self.messages_received += 1;
                         }
@@ -758,14 +759,14 @@ pub const Connection = struct {
                     .ping => {
                         try messages.append(Message{
                             .type = .ping,
-                            .data = try self.allocator.dupe(u8, frame.payload),
+                            .data = try self.allocator.dupe(u8, mutable_frame.payload),
                             .allocator = self.allocator,
                         });
                     },
                     .pong => {
                         try messages.append(Message{
                             .type = .pong,
-                            .data = try self.allocator.dupe(u8, frame.payload),
+                            .data = try self.allocator.dupe(u8, mutable_frame.payload),
                             .allocator = self.allocator,
                         });
                     },
@@ -773,7 +774,7 @@ pub const Connection = struct {
                         self.state = .closing;
                         try messages.append(Message{
                             .type = .close,
-                            .data = try self.allocator.dupe(u8, frame.payload),
+                            .data = try self.allocator.dupe(u8, mutable_frame.payload),
                             .allocator = self.allocator,
                         });
                     },
@@ -786,7 +787,7 @@ pub const Connection = struct {
                 self.parser.reset();
 
                 // Advance remaining data
-                const frame_size = frame.header.header_size + frame.payload.len;
+                const frame_size = mutable_frame.header.header_size + mutable_frame.payload.len;
                 remaining = remaining[frame_size..];
             } else {
                 // No complete frame yet
