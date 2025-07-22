@@ -173,6 +173,45 @@ pub const TestSuite = struct {
         try self.tests.append(test_case);
     }
 
+    /// Add multiple tests at once for batch registration
+    pub fn addTests(self: *TestSuite, test_cases: []const TestCase) !void {
+        for (test_cases) |test_case| {
+            try self.addTest(test_case);
+        }
+    }
+
+    /// Filter tests by category for selective execution
+    pub fn filterByCategory(self: *TestSuite, category: TestCategory) !TestSuite {
+        var filtered = TestSuite.init(self.allocator, self.name, self.description);
+        for (self.tests.items) |test_case| {
+            if (test_case.category == category) {
+                try filtered.addTest(test_case);
+            }
+        }
+        return filtered;
+    }
+
+    /// Filter tests by priority for selective execution
+    pub fn filterByPriority(self: *TestSuite, min_priority: TestPriority) !TestSuite {
+        var filtered = TestSuite.init(self.allocator, self.name, self.description);
+
+        const priority_values = std.enums.values(TestPriority);
+        const min_index = for (priority_values, 0..) |p, i| {
+            if (p == min_priority) break i;
+        } else priority_values.len;
+
+        for (self.tests.items) |test_case| {
+            const test_index = for (priority_values, 0..) |p, i| {
+                if (p == test_case.priority) break i;
+            } else continue;
+
+            if (test_index <= min_index) {
+                try filtered.addTest(test_case);
+            }
+        }
+        return filtered;
+    }
+
     pub fn runAll(self: *TestSuite) !TestSummary {
         var summary = TestSummary.init(self.allocator);
 
@@ -206,9 +245,28 @@ pub const TestSuite = struct {
             var tracking_allocator = TrackingAllocator.init(self.allocator);
             defer _ = tracking_allocator.deinit();
 
-            // Execute the test function directly with error handling
+            // Execute the test function with timeout support
             const test_fn = test_case.test_fn.?;
+
+            // Simple timeout implementation using wall clock time
+            const timeout_start = std.time.nanoTimestamp();
+            const timeout_ns = @as(i128, test_case.timeout_ms) * 1_000_000;
+
+            var test_completed = false;
+            var test_error: ?anyerror = null;
+
+            // Create a test execution wrapper
             test_fn(tracking_allocator.allocator()) catch |err| {
+                test_error = err;
+            };
+            test_completed = true;
+
+            // Check if we exceeded timeout
+            const elapsed = std.time.nanoTimestamp() - timeout_start;
+            if (!test_completed or elapsed > timeout_ns) {
+                test_case.result = .timeout;
+                test_case.error_message = "Test execution exceeded timeout limit";
+            } else if (test_error) |err| {
                 // Set test result based on error type
                 test_case.result = switch (err) {
                     error.TestExpectedEqual, error.TestExpectedError, error.TestUnexpectedResult, error.TestExpected, error.TestSkipped, error.AssertionFailed => .fail,
@@ -244,7 +302,7 @@ pub const TestSuite = struct {
                     .memory_used = tracking_allocator.total_allocated - tracking_allocator.total_deallocated,
                 };
                 continue;
-            };
+            }
 
             // Test completed successfully
             test_case.result = .pass;
@@ -765,7 +823,8 @@ pub const MemoryTracker = struct {
     const AllocationInfo = struct {
         size: usize,
         timestamp: i128,
-        stack_trace: ?std.builtin.StackTrace = null,
+        stack_trace: ?[]usize = null, // Stack frames
+        allocator_ref: ?Allocator = null, // For deallocation
     };
 
     const Self = @This();
@@ -780,6 +839,17 @@ pub const MemoryTracker = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Clean up any remaining stack traces
+        var iter = self.allocations.iterator();
+        while (iter.next()) |entry| {
+            const info = entry.value_ptr.*;
+            if (info.stack_trace) |trace| {
+                if (info.allocator_ref) |alloc| {
+                    alloc.free(trace);
+                }
+            }
+        }
+
         self.tracking_allocator.deinit();
         self.allocations.deinit();
     }
@@ -807,10 +877,26 @@ pub const MemoryTracker = struct {
     pub fn trackAllocation(self: *Self, ptr: usize, size: usize) !void {
         if (!self.enabled) return;
 
+        // Capture stack trace
+        var stack_trace: ?[]usize = null;
+        if (std.debug.have_ucontext) {
+            var stack_trace_buf: std.builtin.StackTrace = undefined;
+            var addresses: [32]usize = undefined;
+            stack_trace_buf.instruction_addresses = &addresses;
+            stack_trace_buf.index = 0;
+
+            std.debug.captureStackTrace(2, &stack_trace_buf); // Skip 2 frames
+            if (stack_trace_buf.index > 0) {
+                const frames = addresses[0..stack_trace_buf.index];
+                stack_trace = try self.backing_allocator.dupe(usize, frames);
+            }
+        }
+
         const info = AllocationInfo{
             .size = size,
             .timestamp = std.time.nanoTimestamp(),
-            .stack_trace = null, // Stack trace collection would require more setup
+            .stack_trace = stack_trace,
+            .allocator_ref = self.backing_allocator,
         };
         try self.allocations.put(ptr, info);
     }
@@ -818,7 +904,14 @@ pub const MemoryTracker = struct {
     pub fn trackFree(self: *Self, ptr: usize) void {
         if (!self.enabled) return;
 
-        _ = self.allocations.remove(ptr);
+        if (self.allocations.fetchRemove(ptr)) |removed| {
+            const info = removed.value;
+            if (info.stack_trace) |trace| {
+                if (info.allocator_ref) |alloc| {
+                    alloc.free(trace);
+                }
+            }
+        }
     }
 
     pub fn checkLeaks(self: *Self) !void {
@@ -835,11 +928,38 @@ pub const MemoryTracker = struct {
                 std.log.err("  Detailed leak information:");
                 var iter = self.allocations.iterator();
                 while (iter.next()) |entry| {
-                    std.log.err("    {} bytes at 0x{X} (allocated at {}ns)", .{ entry.value_ptr.size, entry.key_ptr.*, entry.value_ptr.timestamp });
+                    const info = entry.value_ptr.*;
+                    std.log.err("    {} bytes at 0x{X} (allocated at {}ns)", .{ info.size, entry.key_ptr.*, info.timestamp });
+
+                    // Print stack trace if available
+                    if (info.stack_trace) |trace| {
+                        std.log.err("      Stack trace:");
+                        self.printStackTrace(trace) catch {};
+                    } else {
+                        std.log.err("      Stack trace: not available");
+                    }
                 }
             }
 
             return error.MemoryLeak;
+        }
+    }
+
+    fn printStackTrace(self: *Self, trace: []const usize) !void {
+        _ = self; // Unused but needed for method signature
+        for (trace, 0..) |addr, i| {
+            if (i >= 10) break; // Limit to first 10 frames
+
+            // Try to symbolicate the address
+            if (std.debug.getSelfDebugInfo()) |debug_info| {
+                if (std.debug.getSymbolName(debug_info, addr)) |symbol| {
+                    std.log.err("        [{d}] 0x{X} {s}", .{ i, addr, symbol });
+                } else {
+                    std.log.err("        [{d}] 0x{X} <unknown>", .{ i, addr });
+                }
+            } else {
+                std.log.err("        [{d}] 0x{X}", .{ i, addr });
+            }
         }
     }
 

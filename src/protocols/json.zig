@@ -1,11 +1,12 @@
 //! High-performance JSON parser and generator for Ferret
 //!
 //! This implementation focuses on:
-//! - Zero-copy parsing where possible
+//! - Zero-copy string parsing for simple strings (no escape sequences)
 //! - Streaming support for large JSON documents
 //! - Minimal allocations during parsing
 //! - Type-safe value access with compile-time validation
 //! - Fast serialization with configurable formatting
+//! - Configurable string ownership for memory efficiency
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,13 +38,13 @@ pub const ParseError = error{
     TypeMismatch,
 };
 
-/// JSON value representation
+/// JSON value representation with optional zero-copy strings
 pub const Value = union(ValueType) {
     null: void,
     bool: bool,
     int: i64,
     float: f64,
-    string: []const u8,
+    string: struct { data: []const u8, owned: bool },
     array: ArrayList(Value),
     object: StringHashMap(Value),
 
@@ -63,7 +64,7 @@ pub const Value = union(ValueType) {
                 }
                 obj.deinit();
             },
-            .string => |str| allocator.free(str),
+            .string => |str| if (str.owned) allocator.free(str.data),
             else => {},
         }
     }
@@ -100,7 +101,7 @@ pub const Value = union(ValueType) {
     /// Get string value, returns error if not string
     pub fn getString(self: Value) ![]const u8 {
         return switch (self) {
-            .string => |s| s,
+            .string => |s| s.data,
             else => error.TypeMismatch,
         };
     }
@@ -119,6 +120,17 @@ pub const Value = union(ValueType) {
             .object => |o| o,
             else => error.TypeMismatch,
         };
+    }
+
+    /// Create an owned string value (allocates memory)
+    pub fn createOwnedString(allocator: Allocator, str: []const u8) !Value {
+        const owned = try allocator.dupe(u8, str);
+        return Value{ .string = .{ .data = owned, .owned = true } };
+    }
+
+    /// Create a borrowed string value (zero-copy, references external data)
+    pub fn createBorrowedString(str: []const u8) Value {
+        return Value{ .string = .{ .data = str, .owned = false } };
     }
 };
 
@@ -220,11 +232,11 @@ pub const Parser = struct {
                 self.advance(1); // Skip closing quote
 
                 if (needs_unescape) {
-                    return Value{ .string = try self.unescapeString(self.input[start..end]) };
+                    const unescaped = try self.unescapeString(self.input[start..end]);
+                    return Value{ .string = .{ .data = unescaped, .owned = true } };
                 } else {
-                    // Zero-copy string
-                    const str = try self.allocator.dupe(u8, self.input[start..end]);
-                    return Value{ .string = str };
+                    // True zero-copy string - reference original input
+                    return Value{ .string = .{ .data = self.input[start..end], .owned = false } };
                 }
             } else if (char == '\\') {
                 needs_unescape = true;
@@ -586,7 +598,7 @@ pub const Generator = struct {
             .bool => |b| try self.output.appendSlice(if (b) "true" else "false"),
             .int => |i| try self.output.writer().print("{}", .{i}),
             .float => |f| try self.output.writer().print("{d}", .{f}),
-            .string => |s| try self.generateString(s),
+            .string => |s| try self.generateString(s.data),
             .array => |arr| try self.generateArray(arr),
             .object => |obj| try self.generateObject(obj),
         }
@@ -938,4 +950,50 @@ test "JSON Unicode benchmark" {
     const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
 
     std.log.info("Unicode parsing benchmark: {} iterations in {d:.2} ms ({d:.2} ns/iter)", .{ count, duration_ms, @as(f64, @floatFromInt(duration_ns)) / @as(f64, @floatFromInt(count)) });
+}
+
+test "JSON zero-copy string parsing" {
+    const allocator = std.testing.allocator;
+
+    // Test zero-copy string (no escaping needed)
+    const json_input = "\"hello world\"";
+    {
+        var value = try parseFromString(allocator, json_input);
+        defer value.deinit(allocator);
+
+        try std.testing.expectEqualStrings("hello world", try value.getString());
+
+        // Verify it's actually zero-copy (not owned)
+        switch (value) {
+            .string => |s| try std.testing.expect(!s.owned),
+            else => return error.TypeMismatch,
+        }
+    }
+
+    // Test owned string (requires unescaping)
+    {
+        var value = try parseFromString(allocator, "\"hello\\nworld\"");
+        defer value.deinit(allocator);
+
+        try std.testing.expectEqualStrings("hello\nworld", try value.getString());
+
+        // Verify it's owned (allocated memory)
+        switch (value) {
+            .string => |s| try std.testing.expect(s.owned),
+            else => return error.TypeMismatch,
+        }
+    }
+
+    // Test convenience methods
+    {
+        const borrowed = Value.createBorrowedString("borrowed");
+        try std.testing.expectEqualStrings("borrowed", try borrowed.getString());
+        // No deinit needed for borrowed strings
+    }
+
+    {
+        var owned = try Value.createOwnedString(allocator, "owned");
+        defer owned.deinit(allocator);
+        try std.testing.expectEqualStrings("owned", try owned.getString());
+    }
 }

@@ -322,6 +322,7 @@ pub const Request = struct {
     query: ?[]const u8,
     version: Version,
     headers: Headers,
+    trailers: Headers,
     body: ?[]const u8,
 
     const Self = @This();
@@ -333,12 +334,14 @@ pub const Request = struct {
             .query = null,
             .version = .http_1_1,
             .headers = Headers.init(allocator),
+            .trailers = Headers.init(allocator),
             .body = null,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
+        self.trailers.deinit();
     }
 };
 
@@ -347,6 +350,7 @@ pub const Response = struct {
     version: Version,
     status: Status,
     headers: Headers,
+    trailers: Headers,
     body: ?[]const u8,
 
     const Self = @This();
@@ -356,12 +360,14 @@ pub const Response = struct {
             .version = .http_1_1,
             .status = .ok,
             .headers = Headers.init(allocator),
+            .trailers = Headers.init(allocator),
             .body = null,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
+        self.trailers.deinit();
     }
 
     /// Format response as HTTP message
@@ -405,6 +411,15 @@ const ParserFlags = packed struct {
     reserved: u1 = 0,
 };
 
+/// Check if character is valid in HTTP header name (RFC 7230)
+fn isValidHeaderNameChar(char: u8) bool {
+    return switch (char) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        '0'...'9', 'A'...'Z', 'a'...'z' => true,
+        else => false,
+    };
+}
+
 /// HTTP parser callbacks
 pub const ParserCallbacks = struct {
     on_method: ?*const fn (method: Method) void = null,
@@ -415,6 +430,7 @@ pub const ParserCallbacks = struct {
     on_header: ?*const fn (name: []const u8, value: []const u8) void = null,
     on_headers_complete: ?*const fn () void = null,
     on_body: ?*const fn (data: []const u8) void = null,
+    on_trailer: ?*const fn (name: []const u8, value: []const u8) void = null,
     on_message_complete: ?*const fn () void = null,
     on_error: ?*const fn (err: ParserError) void = null,
 };
@@ -451,6 +467,8 @@ pub const Parser = struct {
         chunk_size,
         chunk_data,
         chunk_trailer,
+        trailer_name,
+        trailer_value,
         message_complete,
         error_state,
     } = .start,
@@ -545,6 +563,12 @@ pub const Parser = struct {
                 },
                 .chunk_trailer => {
                     pos = try self.parseChunkTrailer(data, pos);
+                },
+                .trailer_name => {
+                    pos = try self.parseTrailerName(data, pos);
+                },
+                .trailer_value => {
+                    pos = try self.parseTrailerValue(data, pos);
                 },
                 .message_complete => {
                     if (self.callbacks.on_message_complete) |callback| {
@@ -876,16 +900,73 @@ pub const Parser = struct {
 
     /// Parse chunk trailer (after last chunk)
     fn parseChunkTrailer(self: *Self, data: []const u8, pos: usize) ParserError!usize {
-        // For simplicity, we'll just look for the final CRLF
         if (self.findEOL(data, pos)) |eol| {
             if (eol.pos == pos) {
-                // Empty line, chunks complete
+                // Empty line, trailers complete
                 self.state = .message_complete;
                 return eol.pos + eol.len;
             } else {
-                // Trailer header, skip for now
+                // Start parsing trailer header
+                self.state = .trailer_name;
+                return pos;
+            }
+        }
+        return pos; // Need more data
+    }
+
+    /// Parse trailer header name
+    fn parseTrailerName(self: *Self, data: []const u8, pos: usize) ParserError!usize {
+        if (self.findEOL(data, pos)) |eol| {
+            // Empty line indicates end of trailers
+            if (eol.pos == pos) {
+                self.state = .message_complete;
                 return eol.pos + eol.len;
             }
+        }
+
+        // Look for colon separator
+        if (self.findChar(data, pos, ':')) |colon_pos| {
+            if (colon_pos > pos) {
+                const name = mem.trim(u8, data[pos..colon_pos], " \t");
+
+                // Validate header name
+                if (name.len == 0) return ParserError.InvalidHeader;
+                for (name) |char| {
+                    if (!isValidHeaderNameChar(char)) {
+                        return ParserError.InvalidHeader;
+                    }
+                }
+
+                self.current_header_name = name;
+                self.state = .trailer_value;
+                return colon_pos + 1;
+            }
+        }
+
+        // Check if we have a complete line but no colon (invalid)
+        if (self.findEOL(data, pos)) |_| {
+            return ParserError.InvalidHeader;
+        }
+
+        return pos; // Need more data
+    }
+
+    /// Parse trailer header value
+    fn parseTrailerValue(self: *Self, data: []const u8, pos: usize) ParserError!usize {
+        if (self.findEOL(data, pos)) |eol| {
+            const value = mem.trim(u8, data[pos..eol.pos], " \t");
+
+            if (self.current_header_name) |name| {
+                // Call trailer callback
+                if (self.callbacks.on_trailer) |callback| {
+                    callback(name, value);
+                }
+                self.current_header_name = null;
+            }
+
+            // Continue looking for more trailers
+            self.state = .chunk_trailer;
+            return eol.pos + eol.len;
         }
         return pos; // Need more data
     }
@@ -1102,4 +1183,59 @@ test "Headers safe value ownership" {
     // Verify values are accessible
     try testing.expectEqualStrings("example.com", borrowed_headers.get("host").?);
     try testing.expectEqualStrings("Bearer token", owned_headers.get("authorization").?);
+}
+
+test "HTTP chunked encoding with trailers parsing" {
+    const TrailerEntry = struct { name: []const u8, value: []const u8 };
+
+    const TestData = struct {
+        var trailers: std.ArrayList(TrailerEntry) = undefined;
+        var message_complete = false;
+
+        fn onTrailer(name: []const u8, value: []const u8) void {
+            trailers.append(.{ .name = name, .value = value }) catch {};
+        }
+
+        fn onMessageComplete() void {
+            message_complete = true;
+        }
+    };
+
+    TestData.trailers = std.ArrayList(TrailerEntry).init(testing.allocator);
+    defer TestData.trailers.deinit();
+    TestData.message_complete = false;
+
+    var parser = Parser.init();
+    parser.callbacks = .{
+        .on_trailer = TestData.onTrailer,
+        .on_message_complete = TestData.onMessageComplete,
+    };
+
+    // HTTP request with chunked encoding and trailers
+    const http_data =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "Trailer: X-Checksum, X-Upload-Time\r\n" ++
+        "\r\n" ++
+        "7\r\n" ++
+        "Mozilla\r\n" ++
+        "9\r\n" ++
+        "Developer\r\n" ++
+        "7\r\n" ++
+        "Network\r\n" ++
+        "0\r\n" ++
+        "X-Checksum: abc123\r\n" ++
+        "X-Upload-Time: 1234567890\r\n" ++
+        "\r\n";
+
+    _ = try parser.parse(http_data);
+
+    // Verify trailers were parsed correctly
+    try testing.expect(TestData.trailers.items.len == 2);
+    try testing.expectEqualStrings("X-Checksum", TestData.trailers.items[0].name);
+    try testing.expectEqualStrings("abc123", TestData.trailers.items[0].value);
+    try testing.expectEqualStrings("X-Upload-Time", TestData.trailers.items[1].name);
+    try testing.expectEqualStrings("1234567890", TestData.trailers.items[1].value);
+    try testing.expect(TestData.message_complete);
 }
