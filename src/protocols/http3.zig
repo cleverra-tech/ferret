@@ -604,7 +604,7 @@ pub const CryptoState = struct {
 
         // Update extensions length
         const extensions_len = client_hello.items.len - extensions_length_offset - 2;
-        mem.writeInt(u16, client_hello.items[extensions_length_offset..extensions_length_offset+2][0..2], @intCast(extensions_len), .big);
+        mem.writeInt(u16, client_hello.items[extensions_length_offset .. extensions_length_offset + 2][0..2], @intCast(extensions_len), .big);
 
         // Update total length
         const total_len = client_hello.items.len - 4;

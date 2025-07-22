@@ -762,7 +762,7 @@ pub const Client = struct {
         // Create QUIC transport connection
         const local_addr = try net.Address.parseIp4("0.0.0.0", 0);
         const remote_addr = try net.Address.resolveIp(uri_info.host, uri_info.port);
-        
+
         var quic_transport = try http3.QuicTransport.init(self.allocator, local_addr, remote_addr);
         defer quic_transport.deinit();
 
@@ -774,12 +774,7 @@ pub const Client = struct {
         defer self.deallocateQpackHeaders(&qpack_headers);
 
         // Send HTTP/3 request
-        const stream_id = try quic_transport.connection.sendRequest(
-            request.method.toString(),
-            uri_info.path,
-            qpack_headers.items,
-            request.body
-        );
+        const stream_id = try quic_transport.connection.sendRequest(request.method.toString(), uri_info.path, qpack_headers.items, request.body);
 
         // Read HTTP/3 response
         var http3_response = try quic_transport.connection.readResponse(stream_id);
@@ -842,7 +837,7 @@ pub const Client = struct {
         return qpack_headers;
     }
 
-    /// Deallocate QPACK headers 
+    /// Deallocate QPACK headers
     fn deallocateQpackHeaders(self: *Self, headers: *std.ArrayList(http3.QpackDecoder.QpackEntry)) void {
         for (headers.items) |header| {
             self.allocator.free(header.name);
@@ -854,11 +849,11 @@ pub const Client = struct {
     /// Convert HTTP/3 response to unified response format
     fn convertHttp3Response(self: *Self, http3_response: http3.Http3Response) !Response {
         var response = Response.init(self.allocator, .ok);
-        
+
         // Extract status code from pseudo-header or use default
-        response.status = if (http3_response.status > 0) 
-            @enumFromInt(http3_response.status) 
-        else 
+        response.status = if (http3_response.status > 0)
+            @enumFromInt(http3_response.status)
+        else
             .ok;
 
         response.version = .http_3_0;
