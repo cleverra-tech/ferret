@@ -95,21 +95,41 @@ pub fn LockFreeQueue(comptime T: type) type {
             }
         };
 
+        /// Optional deallocator function for memory management
+        pub const ItemDeallocator = ?*const fn (allocator: std.mem.Allocator, item: T) void;
+
         head: std.atomic.Value(?*Node),
         tail: std.atomic.Value(?*Node),
         allocator: std.mem.Allocator,
+        item_deallocator: ItemDeallocator,
 
         pub fn init(allocator: std.mem.Allocator) !Self {
             return Self{
                 .head = std.atomic.Value(?*Node).init(null),
                 .tail = std.atomic.Value(?*Node).init(null),
                 .allocator = allocator,
+                .item_deallocator = null,
+            };
+        }
+
+        pub fn initWithDeallocator(allocator: std.mem.Allocator, item_deallocator: ItemDeallocator) !Self {
+            return Self{
+                .head = std.atomic.Value(?*Node).init(null),
+                .tail = std.atomic.Value(?*Node).init(null),
+                .allocator = allocator,
+                .item_deallocator = item_deallocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            // Dequeue all remaining items
-            while (self.dequeue()) |_| {}
+            // Dequeue and deallocate all remaining items
+            if (self.item_deallocator) |deallocator| {
+                while (self.dequeue()) |item| {
+                    deallocator(self.allocator, item);
+                }
+            } else {
+                while (self.dequeue()) |_| {}
+            }
         }
 
         pub fn enqueue(self: *Self, data: T) !void {

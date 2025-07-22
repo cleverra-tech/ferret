@@ -11,6 +11,27 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
+/// Common deallocator for string slices
+pub fn deallocateString(allocator: Allocator, string: []const u8) void {
+    allocator.free(@constCast(string));
+}
+
+/// Common deallocator for byte slices
+pub fn deallocateSlice(allocator: Allocator, slice: []const u8) void {
+    allocator.free(@constCast(slice));
+}
+
+/// Deallocator for types with deinit() method
+pub fn deallocateWithDeinit(comptime T: type) fn (allocator: Allocator, value: T) void {
+    return struct {
+        fn deallocate(allocator: Allocator, value: T) void {
+            _ = allocator;
+            var mutable_value = value;
+            mutable_value.deinit();
+        }
+    }.deallocate;
+}
+
 /// Errors that can occur during queue operations
 pub const QueueError = error{
     /// Queue has reached its maximum capacity (ArrayQueue only)
@@ -27,12 +48,16 @@ pub fn ArrayQueue(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// Optional deallocator function for memory management
+        pub const ItemDeallocator = ?*const fn (allocator: Allocator, item: T) void;
+
         items: []T,
         head: usize,
         tail: usize,
         count: usize,
         capacity: usize,
         allocator: Allocator,
+        item_deallocator: ItemDeallocator,
 
         /// Initialize a new ArrayQueue with the specified capacity
         pub fn init(allocator: Allocator, capacity: usize) QueueError!Self {
@@ -46,11 +71,34 @@ pub fn ArrayQueue(comptime T: type) type {
                 .count = 0,
                 .capacity = capacity,
                 .allocator = allocator,
+                .item_deallocator = null,
+            };
+        }
+
+        /// Initialize a new ArrayQueue with the specified capacity and deallocator
+        pub fn initWithDeallocator(allocator: Allocator, capacity: usize, item_deallocator: ItemDeallocator) QueueError!Self {
+            if (capacity == 0) return QueueError.InvalidCapacity;
+
+            const items = allocator.alloc(T, capacity) catch return QueueError.OutOfMemory;
+            return Self{
+                .items = items,
+                .head = 0,
+                .tail = 0,
+                .count = 0,
+                .capacity = capacity,
+                .allocator = allocator,
+                .item_deallocator = item_deallocator,
             };
         }
 
         /// Deinitialize the queue and free all memory
         pub fn deinit(self: *Self) void {
+            // Deallocate all remaining items if deallocator is provided
+            if (self.item_deallocator) |deallocator| {
+                while (self.dequeue()) |item| {
+                    deallocator(self.allocator, item);
+                }
+            }
             self.allocator.free(self.items);
             self.* = undefined;
         }
@@ -116,9 +164,16 @@ pub fn ArrayQueue(comptime T: type) type {
 
         /// Clear all items from the queue
         pub fn clear(self: *Self) void {
-            self.head = 0;
-            self.tail = 0;
-            self.count = 0;
+            // Deallocate all items if deallocator is provided
+            if (self.item_deallocator) |deallocator| {
+                while (self.dequeue()) |item| {
+                    deallocator(self.allocator, item);
+                }
+            } else {
+                self.head = 0;
+                self.tail = 0;
+                self.count = 0;
+            }
         }
 
         /// Get an iterator over the queue items (from front to back)
@@ -156,10 +211,14 @@ pub fn LinkedQueue(comptime T: type) type {
             next: ?*Node,
         };
 
+        /// Optional deallocator function for memory management
+        pub const ItemDeallocator = ?*const fn (allocator: Allocator, item: T) void;
+
         head: ?*Node,
         tail: ?*Node,
         count: usize,
         allocator: Allocator,
+        item_deallocator: ItemDeallocator,
 
         /// Initialize a new LinkedQueue
         pub fn init(allocator: Allocator) Self {
@@ -168,12 +227,24 @@ pub fn LinkedQueue(comptime T: type) type {
                 .tail = null,
                 .count = 0,
                 .allocator = allocator,
+                .item_deallocator = null,
+            };
+        }
+
+        /// Initialize a new LinkedQueue with deallocator
+        pub fn initWithDeallocator(allocator: Allocator, item_deallocator: ItemDeallocator) Self {
+            return Self{
+                .head = null,
+                .tail = null,
+                .count = 0,
+                .allocator = allocator,
+                .item_deallocator = item_deallocator,
             };
         }
 
         /// Deinitialize the queue and free all nodes
         pub fn deinit(self: *Self) void {
-            while (self.dequeue()) |_| {}
+            self.clear();
             self.* = undefined;
         }
 
@@ -211,6 +282,18 @@ pub fn LinkedQueue(comptime T: type) type {
             return data;
         }
 
+        /// Remove and deallocate an item from the front of the queue
+        /// Returns true if an item was removed, false if queue is empty
+        pub fn dequeueAndDeallocate(self: *Self) bool {
+            if (self.dequeue()) |item| {
+                if (self.item_deallocator) |deallocator| {
+                    deallocator(self.allocator, item);
+                }
+                return true;
+            }
+            return false;
+        }
+
         /// Peek at the front item without removing it
         /// Returns null if the queue is empty
         pub fn peek(self: *const Self) ?T {
@@ -237,7 +320,11 @@ pub fn LinkedQueue(comptime T: type) type {
 
         /// Clear all items from the queue
         pub fn clear(self: *Self) void {
-            while (self.dequeue()) |_| {}
+            if (self.item_deallocator != null) {
+                while (self.dequeueAndDeallocate()) {}
+            } else {
+                while (self.dequeue()) |_| {}
+            }
         }
 
         /// Get an iterator over the queue items (from front to back)
@@ -444,4 +531,77 @@ test "Queue performance characteristics" {
     std.log.info("ArrayQueue performance: {} items", .{iterations});
     std.log.info("  Enqueue: {d:.2} ns/op", .{@as(f64, @floatFromInt(enqueue_time)) / @as(f64, @floatFromInt(iterations))});
     std.log.info("  Dequeue: {d:.2} ns/op", .{@as(f64, @floatFromInt(dequeue_time)) / @as(f64, @floatFromInt(iterations))});
+}
+
+test "ArrayQueue memory management with string deallocators" {
+    const allocator = testing.allocator;
+
+    var queue = try ArrayQueue([]const u8).initWithDeallocator(allocator, 4, deallocateString);
+    defer queue.deinit();
+
+    // Create owned strings
+    const str1 = try allocator.dupe(u8, "hello");
+    const str2 = try allocator.dupe(u8, "world");
+    const str3 = try allocator.dupe(u8, "test");
+
+    try queue.enqueue(str1);
+    try queue.enqueue(str2);
+    try queue.enqueue(str3);
+
+    // Dequeue one item normally (user needs to deallocate)
+    const dequeued = queue.dequeue().?;
+    testing.allocator.free(@constCast(dequeued));
+
+    // Clear will deallocate remaining items automatically
+    queue.clear();
+}
+
+test "LinkedQueue memory management with string deallocators" {
+    const allocator = testing.allocator;
+
+    var queue = LinkedQueue([]const u8).initWithDeallocator(allocator, deallocateString);
+    defer queue.deinit();
+
+    // Create owned strings
+    const str1 = try allocator.dupe(u8, "hello");
+    const str2 = try allocator.dupe(u8, "world");
+    const str3 = try allocator.dupe(u8, "test");
+
+    try queue.enqueue(str1);
+    try queue.enqueue(str2);
+    try queue.enqueue(str3);
+
+    // Use dequeueAndDeallocate to automatically free memory
+    try testing.expect(queue.dequeueAndDeallocate());
+    try testing.expect(queue.len() == 2);
+
+    // deinit() will deallocate remaining items
+}
+
+test "Queue clear with deallocation" {
+    const allocator = testing.allocator;
+
+    var array_queue = try ArrayQueue([]const u8).initWithDeallocator(allocator, 4, deallocateString);
+    defer array_queue.deinit();
+
+    var linked_queue = LinkedQueue([]const u8).initWithDeallocator(allocator, deallocateString);
+    defer linked_queue.deinit();
+
+    // Add items to both queues
+    const str1 = try allocator.dupe(u8, "test1");
+    const str2 = try allocator.dupe(u8, "test2");
+    const str3 = try allocator.dupe(u8, "test3");
+    const str4 = try allocator.dupe(u8, "test4");
+
+    try array_queue.enqueue(str1);
+    try array_queue.enqueue(str2);
+    try linked_queue.enqueue(str3);
+    try linked_queue.enqueue(str4);
+
+    // Clear should deallocate all items
+    array_queue.clear();
+    linked_queue.clear();
+
+    try testing.expect(array_queue.isEmpty());
+    try testing.expect(linked_queue.isEmpty());
 }
